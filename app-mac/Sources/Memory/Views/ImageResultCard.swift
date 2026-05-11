@@ -9,43 +9,58 @@ struct ImageResultCard: View {
 
     @State private var image: NSImage?
     @State private var loadFailed = false
+    @State private var expanded = false
+
+    private let previewMaxHeight: CGFloat = 360
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            thumbnail
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Avatar(name: result.contactNames.first ?? "Unknown", contactKey: nil, size: 22)
-                    Text(headerLine)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundColor(.white.opacity(0.9))
-                        .lineLimit(1)
-                    Spacer()
-                    Text(formatDate(result.dateStart))
+        VStack(alignment: .leading, spacing: expanded ? 10 : 0) {
+            HStack(alignment: .top, spacing: 12) {
+                thumbnail
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Avatar(name: result.contactNames.first ?? "Unknown", contactKey: nil, size: 22)
+                        Text(headerLine)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundColor(.white.opacity(0.9))
+                            .lineLimit(1)
+                        Spacer()
+                        Text(formatDate(result.dateStart))
+                            .font(.system(size: 10.5))
+                            .foregroundColor(Theme.tertiaryText)
+                    }
+                    if let caption = result.imageCaption, !caption.isEmpty {
+                        Text(caption)
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.secondaryText)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(expanded ? "Tap image to collapse · double-tap to open" : "Tap to preview")
                         .font(.system(size: 10.5))
-                        .foregroundColor(Theme.tertiaryText)
+                        .foregroundColor(Theme.tertiaryText.opacity(0.7))
                 }
-                if let caption = result.imageCaption, !caption.isEmpty {
-                    Text(caption)
-                        .font(.system(size: 12))
-                        .foregroundColor(Theme.secondaryText)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Text("Image · CLIP match")
-                    .font(.system(size: 10.5))
-                    .foregroundColor(Theme.tertiaryText.opacity(0.7))
+                Spacer()
             }
-            Spacer()
+            if expanded, let image = image {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: previewMaxHeight, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(highlighted ? Color.white.opacity(0.06) : Color.white.opacity(0.02))
+                .fill(highlighted || expanded ? Color.white.opacity(0.06) : Color.white.opacity(0.02))
         )
         .task(id: result.imageURL) { await loadImage() }
+        .contentShape(Rectangle())
         .onTapGesture(count: 2) { openInViewer() }
+        .onTapGesture { expanded.toggle() }
+        .animation(.easeOut(duration: 0.18), value: expanded)
     }
 
     @ViewBuilder

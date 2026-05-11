@@ -12,8 +12,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var hotKey: GlobalHotKey?
     private var statusItem: NSStatusItem?
     private let panelWidth: CGFloat = 720
-    private let panelMinHeight: CGFloat = 64
-    private let panelMaxHeight: CGFloat = 720
+    private let panelMinHeight: CGFloat = 56  // matches the input row exactly
+    private let panelMaxHeight: CGFloat = 640
+    // Clears the search state if the panel stays hidden this long. The timer
+    // runs ONLY while the panel is hidden — a user who keeps Semse open and
+    // reads results never gets reset.
+    private let idleClearAfterSeconds: UInt64 = 60
+    private var idleClearTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let panel = SpotlightPanel()
@@ -23,33 +28,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             onContentHeightChange: { [weak self] h in self?.handleContentHeightChanged(h) }
         )
         let hosting = NSHostingView(rootView: root)
-        // Wrap the hosting view in an AppKit NSScrollView so long content can
-        // scroll without SwiftUI's ScrollView machinery interfering with the
-        // intrinsic-content-size loop.
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = false
-        scroll.scrollerStyle = .overlay
-        scroll.drawsBackground = false
-        scroll.contentView.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.documentView = hosting
-        // Pin hosting to the scroll view's edges so it auto-sizes width-wise.
+        hosting.sizingOptions = [.intrinsicContentSize]
+        // Pin the hosting view directly into the blur container. We had an
+        // NSScrollView wrapping it, but its document-view positioning fought
+        // our manual Auto Layout constraints on the first layout pass, which
+        // caused the content to render at ~50% offset within the panel frame.
+        // The panel is capped at panelMaxHeight = 640; if results overflow,
+        // SwiftUI clips. That's acceptable for now.
         hosting.translatesAutoresizingMaskIntoConstraints = false
+        panel.blurContainer.addSubview(hosting)
         NSLayoutConstraint.activate([
-            hosting.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            hosting.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            hosting.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-        ])
-        panel.blurContainer.addSubview(scroll)
-        NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: panel.blurContainer.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: panel.blurContainer.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: panel.blurContainer.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: panel.blurContainer.bottomAnchor),
+            hosting.topAnchor.constraint(equalTo: panel.blurContainer.topAnchor),
+            hosting.leadingAnchor.constraint(equalTo: panel.blurContainer.leadingAnchor),
+            hosting.trailingAnchor.constraint(equalTo: panel.blurContainer.trailingAnchor),
         ])
         self.spotlightPanel = panel
         self.hosting = hosting
+        // Force one layout pass so SwiftUI computes its intrinsic size before
+        // the panel is shown; the first onPreferenceChange will then carry the
+        // real content height instead of a transient zero/initial reading.
+        hosting.layoutSubtreeIfNeeded()
 
         hotKey = GlobalHotKey(
             keyCode: UInt32(kVK_Space),
@@ -71,7 +69,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let panel = spotlightPanel else { return }
         guard height > 1 else { return }  // ignore the no-content reading
         let target = max(panelMinHeight, min(panelMaxHeight, height))
-        if abs(panel.frame.height - target) < 0.5 { return }
+        // Round to whole pixels — sub-pixel deltas were causing the resize
+        // chain to occasionally no-op on legitimate height changes.
+        if Int(panel.frame.height.rounded()) == Int(target.rounded()) { return }
         // Keep the top edge fixed: in AppKit the y origin is the BOTTOM of the
         // window, so growing height means lowering origin.y so the top stays put.
         let oldFrame = panel.frame
@@ -82,6 +82,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             height: target
         )
         panel.setFrame(newFrame, display: true, animate: false)
+        // Window shadow is cached against the previous alpha mask; force a
+        // redraw so the shadow follows the new rounded bottom edge.
+        panel.invalidateShadow()
     }
 
     // MARK: - Status item
@@ -118,10 +121,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func showPanel() {
         guard let panel = spotlightPanel else { return }
+        // Reopening within the idle window keeps the previous search.
+        idleClearTask?.cancel()
+        idleClearTask = nil
+        // Do NOT reset the panel to compact height here. The panel's frame
+        // already reflects the current SwiftUI content:
+        //   - On first launch, init's contentRect was set to panelMinHeight.
+        //   - If results are persisted from the previous open, panel is
+        //     still at the matching height.
+        //   - If the idle-clear notification fired while hidden, SearchView's
+        //     state was wiped and SwiftUI re-emitted its smaller preference,
+        //     shrinking the panel even before reopen.
+        // Forcing compact here caused the "tiny sliver of results" bug after
+        // close+reopen with a persisted query — SwiftUI's preferenceChange
+        // never re-fires when its value hasn't changed.
         positionPanel(panel)
         NSApp.activate(ignoringOtherApps: true)
         panel.orderFrontRegardless()
         panel.makeKeyAndOrderFront(nil)
+        panel.invalidateShadow()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             NotificationCenter.default.post(name: .focusSearchField, object: nil)
         }
@@ -129,6 +147,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func hidePanel() {
         spotlightPanel?.orderOut(nil)
+        // Arm the idle clear timer. If the panel stays hidden for the full
+        // window, we reset SearchView state; reopening before then cancels.
+        idleClearTask?.cancel()
+        let seconds = idleClearAfterSeconds
+        idleClearTask = Task {
+            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            if Task.isCancelled { return }
+            await MainActor.run {
+                NotificationCenter.default.post(name: .clearSearchState, object: nil)
+            }
+        }
     }
 
     private func positionPanel(_ panel: NSPanel) {

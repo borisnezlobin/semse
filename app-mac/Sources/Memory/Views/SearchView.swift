@@ -13,13 +13,15 @@ struct SearchView: View {
 
     @State private var debounceTask: Task<Void, Never>?
     @State private var currentTask: Task<Void, Never>?
-    @State private var idleTask: Task<Void, Never>?
+    @State private var resultsContentHeight: CGFloat = 0
     @FocusState private var focused: Bool
 
     private let minQueryLength = 3
     private let debounceMs: UInt64 = 250
-    private let idleResetSeconds: UInt64 = 60
-    private let scrollMaxHeight: CGFloat = 560
+    // Max height for the results scroll area. The panel itself caps at 640
+    // (see panelMaxHeight in AppDelegate); 540 leaves room for the input row
+    // and a small padding above the divider.
+    private let scrollMaxHeight: CGFloat = 540
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,31 +31,57 @@ struct SearchView: View {
 
             if showsBody {
                 Divider().background(Theme.dividerLine)
-                // No SwiftUI ScrollView — it interacts poorly with NSHostingView's
-                // intrinsic sizing (the SwiftUI scroll machinery proposes its own
-                // height, which fights our KVO-driven panel resize). Instead, the
-                // content lays out naturally; the AppKit panel grows up to its max
-                // height, and we use an AppKit NSScrollView wrapper *outside*
-                // SwiftUI when the content overflows.
-                resultsContent
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // Inner GeometryReader measures resultsContent's natural
+                // height; the ScrollView frame is then min(measured, max) so
+                // the panel grows with results up to scrollMaxHeight, then
+                // scrolling kicks in inside the panel.
+                ScrollView(.vertical, showsIndicators: true) {
+                    resultsContent
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: ResultsContentHeightKey.self,
+                                    value: proxy.size.height
+                                )
+                            }
+                        )
+                }
+                .frame(height: min(max(resultsContentHeight, 1), scrollMaxHeight))
+                .onPreferenceChange(ResultsContentHeightKey.self) { newHeight in
+                    resultsContentHeight = newHeight
+                }
             }
         }
         .frame(width: 720)
+        .fixedSize(horizontal: false, vertical: true)
         .background(
             GeometryReader { proxy in
                 Color.clear.preference(key: ContentHeightKey.self, value: proxy.size.height)
             }
         )
         .onPreferenceChange(ContentHeightKey.self) { newHeight in
-            onContentHeightChange(newHeight)
+            // Hop to the next runloop tick so the panel resize doesn't run
+            // inside the same layout pass that produced the new height.
+            // Same-pass resize was breaking the chain on subsequent queries.
+            DispatchQueue.main.async {
+                onContentHeightChange(newHeight)
+            }
         }
-        .onAppear { focused = true; armIdleReset() }
+        .onAppear { focused = true }
         .onReceive(NotificationCenter.default.publisher(for: .focusSearchField)) { _ in
             focused = true
-            armIdleReset()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .clearSearchState)) { _ in
+            // Fired by AppDelegate after the panel has stayed hidden long
+            // enough — wipe the search so the next open is fresh.
+            query = ""
+            response = nil
+            error = nil
+            currentTask?.cancel()
+            debounceTask?.cancel()
         }
         .background(KeyMonitor(onEsc: handleEsc, onArrow: handleArrow))
     }
@@ -113,7 +141,6 @@ struct SearchView: View {
                     .focused($focused)
                     .onChange(of: query) { _, newValue in
                         scheduleSearch(for: newValue)
-                        armIdleReset()
                     }
             }
         }
@@ -181,19 +208,6 @@ struct SearchView: View {
         await task.value
     }
 
-    private func armIdleReset() {
-        idleTask?.cancel()
-        idleTask = Task {
-            try? await Task.sleep(nanoseconds: idleResetSeconds * 1_000_000_000)
-            if Task.isCancelled { return }
-            await MainActor.run {
-                query = ""
-                response = nil
-                error = nil
-            }
-        }
-    }
-
     private func handleEsc() {
         if !query.isEmpty || response != nil {
             query = ""
@@ -210,7 +224,6 @@ struct SearchView: View {
         case .down: highlightIdx = min(count - 1, highlightIdx + 1)
         case .up:   highlightIdx = max(0, highlightIdx - 1)
         }
-        armIdleReset()
     }
 }
 
@@ -218,12 +231,23 @@ enum ArrowDirection { case up, down }
 
 extension Notification.Name {
     static let focusSearchField = Notification.Name("memory.focusSearchField")
+    static let clearSearchState = Notification.Name("memory.clearSearchState")
 }
 
 /// SearchView reports its laid-out height through this preference so the
 /// AppKit panel can resize. Replaces the old NSHostingView.intrinsicContentSize
 /// KVO, which doesn't fire on SwiftUI re-layouts.
 private struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// Measures the natural height of the results-content stack so the
+/// surrounding ScrollView can cap itself at scrollMaxHeight while still
+/// shrinking to fit when results are short.
+private struct ResultsContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())

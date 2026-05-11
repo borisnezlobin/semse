@@ -5,8 +5,18 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Iterable, Iterator
 
+import numpy as np
+
 from contacts import ContactResolver, UNKNOWN_LABEL
 from parse_imessage import IMessageRow
+
+# Thread-aware iMessage chunking knobs. Adjust and re-index if the ambient
+# bucket fragments too aggressively (raise threshold/min_seg) or fails to
+# split clearly distinct conversations (lower threshold).
+THREAD_CHUNK_CAP = 20         # max messages per chunk (both thread + ambient)
+COHESION_WINDOW = 3           # past/future window size for TextTiling-style comparison
+COHESION_THRESHOLD = 0.25     # split where past-vs-future window cosine drops below this
+MIN_SEGMENT_LEN = 5           # don't emit ambient segments smaller than this (merge forward)
 
 
 @dataclass
@@ -55,13 +65,141 @@ def _format_imessage_block(messages: list[ChunkMessage]) -> str:
     return "\n".join(f"{m.sender}: {m.text}" for m in messages)
 
 
+def _build_chunk_from_rows(
+    rows: list[IMessageRow],
+    title: str | None,
+    resolver: ContactResolver | None,
+) -> Chunk:
+    """Build a single Chunk from a list of IMessageRow already sorted by date."""
+    structured: list[ChunkMessage] = []
+    for r in rows:
+        name, key, known = _resolve_speaker(r, resolver)
+        structured.append(
+            ChunkMessage(
+                sender=name,
+                is_from_me=r.is_from_me,
+                text=r.text,
+                date_iso=r.date_iso,
+                contact_key=key,
+                known=known,
+            )
+        )
+    participants = sorted({m.sender for m in structured if not m.is_from_me})
+    return Chunk(
+        chunk_id=_new_id(),
+        source="imessage",
+        contact_names=participants or ["Me"],
+        date_start=rows[0].date_iso,
+        date_end=rows[-1].date_iso,
+        text=_format_imessage_block(structured),
+        row_ids=[r.row_id for r in rows],
+        messages=structured,
+        chat_title=title,
+    )
+
+
+def _split_oversized(
+    rows: list[IMessageRow],
+    title: str | None,
+    resolver: ContactResolver | None,
+    cap: int = THREAD_CHUNK_CAP,
+) -> Iterator[Chunk]:
+    """Emit a single chunk if rows fit; otherwise sequential sub-chunks of size cap."""
+    if not rows:
+        return
+    if len(rows) <= cap:
+        yield _build_chunk_from_rows(rows, title, resolver)
+        return
+    for start in range(0, len(rows), cap):
+        slab = rows[start : start + cap]
+        if slab:
+            yield _build_chunk_from_rows(slab, title, resolver)
+
+
+def _segment_ambient(
+    rows: list[IMessageRow],
+    embeddings: np.ndarray,
+    cap: int = THREAD_CHUNK_CAP,
+    window: int = COHESION_WINDOW,
+    threshold: float = COHESION_THRESHOLD,
+    min_segment: int = MIN_SEGMENT_LEN,
+) -> list[list[int]]:
+    """TextTiling-style segmentation over per-message embeddings.
+
+    At each candidate boundary position i, compare the mean embedding of the
+    `window` messages immediately before i to the mean of the `window`
+    messages starting at i. Where this past-vs-future cohesion drops below
+    `threshold`, mark a segment boundary. Boundaries must be at least
+    `min_segment` messages apart to avoid thrashing on short noisy iMessage
+    chatter. Also splits hard at `cap` messages per segment.
+
+    Returns segments as lists of indices into `rows`.
+    """
+    n = len(rows)
+    if n == 0:
+        return []
+    if n <= window * 2:
+        # Too short for meaningful window comparison; emit as a single segment
+        # (with the hard cap applied as a fallback).
+        if n <= cap:
+            return [list(range(n))]
+        return [list(range(i, min(i + cap, n))) for i in range(0, n, cap)]
+
+    # Collect candidate boundary positions in date order, plus forced cuts at the cap.
+    boundaries: list[int] = []
+    last_boundary = 0
+    for i in range(window, n - window):
+        # Hard cap: if we'd exceed `cap` messages since the last boundary, cut here.
+        if i - last_boundary >= cap:
+            boundaries.append(i)
+            last_boundary = i
+            continue
+        # Must be at least min_segment past the previous boundary.
+        if i - last_boundary < min_segment:
+            continue
+        past = embeddings[i - window : i].mean(axis=0)
+        future = embeddings[i : i + window].mean(axis=0)
+        past_n = past / (np.linalg.norm(past) + 1e-8)
+        future_n = future / (np.linalg.norm(future) + 1e-8)
+        sim = float(np.dot(past_n, future_n))
+        if sim < threshold:
+            boundaries.append(i)
+            last_boundary = i
+
+    # Build segments. Also enforce the cap on the final segment.
+    segments: list[list[int]] = []
+    prev = 0
+    for b in boundaries:
+        segments.append(list(range(prev, b)))
+        prev = b
+    # Tail: split into cap-sized pieces if oversized.
+    tail = list(range(prev, n))
+    while len(tail) > cap:
+        segments.append(tail[:cap])
+        tail = tail[cap:]
+    if tail:
+        segments.append(tail)
+    return segments
+
+
 def chunk_imessages(
     rows: Iterable[IMessageRow],
-    window: int = 20,
-    stride: int = 10,
     resolver: ContactResolver | None = None,
+    embedder=None,
 ) -> Iterator[Chunk]:
-    """Sliding window over messages, grouped by chat_id. Stride 10 over windows of 20."""
+    """Thread-aware chunker for iMessage.
+
+    Within each chat_id (rows already arrive sorted by chat then date):
+      1. Bucket by `thread_originator_guid`: each non-NULL value names a
+         distinct explicit reply thread. The originator message itself joins
+         the thread it spawned when its guid matches an originator-guid value.
+      2. Everything else forms the "ambient" bucket — the chat's main flow.
+      3. Thread buckets emit one chunk each (sub-split if > THREAD_CHUNK_CAP).
+      4. The ambient bucket is segmented by embedding cohesion: each message
+         is embedded; consecutive messages stay together while cosine to the
+         running centroid stays above COHESION_THRESHOLD, then split. Cap at
+         THREAD_CHUNK_CAP messages.
+    """
     current_chat: int | None = None
     buffer: list[IMessageRow] = []
     chat_title: str | None = None
@@ -69,45 +207,44 @@ def chunk_imessages(
     def flush_chat(chat_buf: list[IMessageRow], title: str | None) -> Iterator[Chunk]:
         if not chat_buf:
             return
-        n = len(chat_buf)
-        starts = list(range(0, max(1, n - window + 1), stride))
-        if not starts:
-            starts = [0]
-        if starts[-1] + window < n:
-            starts.append(max(0, n - window))
-        seen_starts: set[int] = set()
-        for s in starts:
-            if s in seen_starts:
-                continue
-            seen_starts.add(s)
-            window_rows = chat_buf[s : s + window]
-            if not window_rows:
-                continue
-            structured: list[ChunkMessage] = []
-            for r in window_rows:
-                name, key, known = _resolve_speaker(r, resolver)
-                structured.append(
-                    ChunkMessage(
-                        sender=name,
-                        is_from_me=r.is_from_me,
-                        text=r.text,
-                        date_iso=r.date_iso,
-                        contact_key=key,
-                        known=known,
-                    )
-                )
-            participants = sorted({m.sender for m in structured if not m.is_from_me})
-            yield Chunk(
-                chunk_id=_new_id(),
-                source="imessage",
-                contact_names=participants or ["Me"],
-                date_start=window_rows[0].date_iso,
-                date_end=window_rows[-1].date_iso,
-                text=_format_imessage_block(structured),
-                row_ids=[r.row_id for r in window_rows],
-                messages=structured,
-                chat_title=title,
-            )
+
+        # 1. Identify which guids appear as originator-guids inside this chat.
+        thread_keys = {r.thread_originator_guid for r in chat_buf if r.thread_originator_guid}
+
+        threads: dict[str, list[IMessageRow]] = {}
+        ambient: list[IMessageRow] = []
+        for r in chat_buf:
+            key = r.thread_originator_guid
+            if key:
+                threads.setdefault(key, []).append(r)
+            elif r.guid and r.guid in thread_keys:
+                # Root message of a thread: group it with the thread it spawned.
+                threads.setdefault(r.guid, []).append(r)
+            else:
+                ambient.append(r)
+
+        # 2. Emit thread chunks, sorted by date.
+        for key, rs in threads.items():
+            rs.sort(key=lambda r: r.date_iso)
+            yield from _split_oversized(rs, title, resolver)
+
+        # 3. Segment the ambient bucket by embedding cohesion.
+        if not ambient:
+            return
+        if embedder is None or len(ambient) == 1:
+            # Without an embedder we fall back to fixed-size chunks of 20 in
+            # date order. Single-message ambient is just one chunk.
+            yield from _split_oversized(ambient, title, resolver)
+            return
+
+        texts = [r.text or "" for r in ambient]
+        embeddings = embedder.embed_batch(texts)
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        segments = _segment_ambient(ambient, embeddings)
+        for seg in segments:
+            seg_rows = [ambient[i] for i in seg]
+            if seg_rows:
+                yield from _split_oversized(seg_rows, title, resolver)
 
     for row in rows:
         if current_chat is None:
@@ -244,7 +381,7 @@ if __name__ == "__main__":
         )
         for i in range(35)
     ]
-    chunks = list(chunk_imessages(fake, window=20, stride=10))
+    chunks = list(chunk_imessages(fake))
     print(f"35 rows → {len(chunks)} chunks")
     for c in chunks:
         print(f"  {len(c.row_ids):2d} rows  contacts={c.contact_names}")

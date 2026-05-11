@@ -65,21 +65,21 @@ private func logRouter(_ message: String) {
 }
 
 private let routerInstructions = """
-You parse personal-search queries into a typed intent. The user is searching their own messages, emails, and photos.
+Parse personal-search queries into a typed intent. The user searches their own messages, emails, and photos.
 
 Rules:
-- topic: the semantic content to embed. Strip filter words ("picture of", "email about", "messages from", "photo I sent to") and contact names. If the query is already just a topic ("white car", "thanksgiving plans"), keep it as-is. Never leave topic empty — if the query is only filters, return the most descriptive remaining noun phrase, or the raw query as a last resort.
-- sources: only fill when explicit. "email" / "mail" → mail. "iMessage" / "text" / "messages" → imessage. "photo" / "picture" / "image" / "screenshot" → image. Don't infer source from topic words alone.
-- contacts: extract proper names the user names. Lowercase first names are fine ("sarah"). Don't fabricate.
-- mustHaveAttachment: true only when the query explicitly asks for visual content (photo, picture, image, screenshot).
+- topic: the semantic core to embed. Strip filler ("picture of", "email about", "from X") and contact names. Keep temporal words ("recently", "yesterday"). Never return ONLY a temporal word; if that's all that's left, return the original query.
+- sources: ["mail"] for email/mail/gmail; ["imessage"] for text/texts/message/messages/iMessage; ["image"] for photo/picture/pic/image/screenshot/gif. Empty if not specified.
+- contacts: PEOPLE only. Never companies/brands/products/places (lockheed, amazon, google, openai, claude, chatgpt are NOT contacts). Lowercase first names fine.
+- mustHaveAttachment: true iff query contains photo/picture/pic/image/screenshot/gif.
 
 Examples:
-"white car" → topic: "white car", sources: [], contacts: [], mustHaveAttachment: false
-"picture of white car" → topic: "white car", sources: [image], contacts: [], mustHaveAttachment: true
-"photo of white car I sent to jerry yan" → topic: "white car", sources: [image], contacts: ["jerry yan"], mustHaveAttachment: true
-"email about multivariable calculus" → topic: "multivariable calculus", sources: [mail], contacts: [], mustHaveAttachment: false
-"email where I was introduced to someone" → topic: "introduced to someone", sources: [mail], contacts: [], mustHaveAttachment: false
-"messages from sarah about thanksgiving" → topic: "thanksgiving", sources: [imessage], contacts: ["sarah"], mustHaveAttachment: false
+"picture of white car" → topic="white car", sources=[image], mustHaveAttachment=true
+"email about calculus" → topic="calculus", sources=[mail]
+"does alarm prefer claude or chatgpt?" → topic="prefer claude or chatgpt", contacts=["alarm"]
+"what did alex say about the trip" → topic="the trip", contacts=["alex"]
+"who did I meet recently?" → topic="who did I meet recently"
+"offer from lockheed" → topic="offer from lockheed", sources=[mail], contacts=[] (lockheed is a company)
 """
 
 /// Parses raw queries into QueryIntent using Apple's on-device Foundation Model.
@@ -90,6 +90,12 @@ actor QueryRouter {
     private let session: LanguageModelSession?
     private var cache: [String: QueryIntentWire] = [:]
     private let cacheLimit = 64
+    // The "tail" of a chain of pending parses. Each new parse captures the
+    // current tail synchronously (inside this actor, no await between read
+    // and update), creates a task that waits on the predecessor, and writes
+    // itself as the new tail. This guarantees session.respond runs strictly
+    // serially even if many callers arrive while one is mid-flight.
+    private var tail: Task<Void, Never> = Task {}
 
     init() {
         if SystemLanguageModel.default.isAvailable {
@@ -112,32 +118,75 @@ actor QueryRouter {
         guard let session else {
             return QueryIntentWire.passthrough(query: trimmed)
         }
-        do {
-            let response = try await session.respond(
-                to: "Parse this query: \(trimmed)",
-                generating: QueryIntent.self
-            )
-            let wire = QueryIntentWire(response.content)
-            let safe = sanitize(wire, originalQuery: trimmed)
-            store(query: trimmed, intent: safe)
-            return safe
-        } catch {
-            logRouter("parse failed: \(error.localizedDescription); falling back to passthrough")
-            return QueryIntentWire.passthrough(query: trimmed)
+        // Capture this call's predecessor and atomically chain. Multiple
+        // callers reading tail in sequence each get a distinct predecessor
+        // because the read+update happens without an intervening await.
+        let predecessor = tail
+        let resultTask = Task<QueryIntentWire, Never> { [weak self] in
+            _ = await predecessor.value  // wait for full settle of prior parse
+            // Belt-and-suspenders: poll isResponding before the next call.
+            await Self.waitUntilReady(session)
+            do {
+                let response = try await session.respond(
+                    to: "Parse this query: \(trimmed)",
+                    generating: QueryIntent.self
+                )
+                let wire = QueryIntentWire(response.content)
+                let safe = await self?.sanitize(wire, originalQuery: trimmed)
+                    ?? QueryIntentWire.passthrough(query: trimmed)
+                await self?.store(query: trimmed, intent: safe)
+                logRouter(
+                    "parsed: \"\(trimmed)\" → topic=\"\(safe.topic)\" " +
+                    "sources=\(safe.sources) contacts=\(safe.contacts) " +
+                    "attachment=\(safe.must_have_attachment)"
+                )
+                return safe
+            } catch {
+                logRouter("parse failed: \(error.localizedDescription); falling back to passthrough")
+                return QueryIntentWire.passthrough(query: trimmed)
+            }
+        }
+        tail = Task { _ = await resultTask.value }
+        return await resultTask.value
+    }
+
+    /// Spin briefly until the language model session reports it's no longer
+    /// responding to a previous prompt. Bounded to ~1.5s of polling so a
+    /// stuck session can't lock the search bar.
+    private static func waitUntilReady(_ session: LanguageModelSession) async {
+        for _ in 0..<75 {
+            if !session.isResponding { return }
+            try? await Task.sleep(nanoseconds: 20_000_000) // 20ms
         }
     }
 
     /// Guard against degenerate parses: empty topic, or a topic the model
-    /// returned literally as the filter words ("email", "picture").
+    /// reduced to only a temporal qualifier ("recently", "yesterday", etc).
+    /// Temporal phrases are handled by the server's temporal.py — if they're
+    /// the only thing left in the topic, the embedding has no signal.
     private func sanitize(_ wire: QueryIntentWire, originalQuery: String) -> QueryIntentWire {
-        let topic = wire.topic.isEmpty ? originalQuery : wire.topic
+        var topic = wire.topic.isEmpty ? originalQuery : wire.topic
+        let normalized = topic.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if Self.bareTemporalTokens.contains(normalized) {
+            topic = originalQuery
+        }
+        // Strip any contact entries that are actually temporal words the
+        // model mistakenly classified as names.
+        let contacts = wire.contacts.filter { !Self.bareTemporalTokens.contains($0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)) }
         return QueryIntentWire(
             topic: topic,
             sources: wire.sources,
-            contacts: wire.contacts,
+            contacts: contacts,
             must_have_attachment: wire.must_have_attachment
         )
     }
+
+    private static let bareTemporalTokens: Set<String> = [
+        "recently", "today", "yesterday", "tomorrow", "tonight",
+        "week", "month", "year", "this week", "last week", "next week",
+        "this month", "last month", "this year", "last year",
+        "now", "ago", "soon",
+    ]
 
     private func store(query: String, intent: QueryIntentWire) {
         if cache.count >= cacheLimit {

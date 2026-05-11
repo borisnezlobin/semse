@@ -124,7 +124,11 @@ def _build_faiss(vectors: np.ndarray, dim: int | None = None) -> faiss.Index:
     return index
 
 
-def _collect_chunks(sources: set[str], resolver: ContactResolver) -> list[Chunk]:
+def _collect_chunks(
+    sources: set[str],
+    resolver: ContactResolver,
+    embedder: Embedder | None = None,
+) -> list[Chunk]:
     from me_identity import discover as discover_me
     user_emails, _ = discover_me()
     print(f"  user identified by {len(user_emails)} email(s)", file=sys.stderr)
@@ -133,7 +137,9 @@ def _collect_chunks(sources: set[str], resolver: ContactResolver) -> list[Chunk]
         print("Parsing iMessage…", file=sys.stderr)
         rows = list(iter_messages())
         print(f"  {len(rows):,} messages", file=sys.stderr)
-        ic = list(chunk_imessages(rows, resolver=resolver))
+        # Pass the embedder through so chunk_imessages can use it for the
+        # ambient-bucket cohesion segmentation.
+        ic = list(chunk_imessages(rows, resolver=resolver, embedder=embedder))
         print(f"  → {len(ic):,} chunks", file=sys.stderr)
         chunks.extend(ic)
     if "mail" in sources:
@@ -231,12 +237,16 @@ def build(sources: set[str]) -> None:
     n_images = 0
 
     if do_text:
-        chunks = _collect_chunks(sources - {"images"}, resolver)
+        # Construct the embedder up front so it can be reused by both the
+        # chunker (for ambient-bucket cohesion segmentation) AND the chunk-
+        # text embedding pass below — avoids loading the model twice.
+        print(f"Loading embedder (all-MiniLM-L6-v2)…", file=sys.stderr)
+        embedder = Embedder()
+        chunks = _collect_chunks(sources - {"images"}, resolver, embedder=embedder)
         if not chunks:
             print("No text chunks produced.", file=sys.stderr)
         else:
-            print(f"Embedding {len(chunks):,} chunks with all-MiniLM-L6-v2…", file=sys.stderr)
-            embedder = Embedder()
+            print(f"Embedding {len(chunks):,} chunks…", file=sys.stderr)
             texts = [c.text for c in chunks]
             vectors = embedder.embed_batch(texts).astype("float32")
             print("Building text FAISS index…", file=sys.stderr)

@@ -17,11 +17,14 @@ CHAT_DB_PATH = Path.home() / "Library" / "Messages" / "chat.db"
 MESSAGE_QUERY = """
 SELECT
   m.rowid,
+  m.guid,
   m.text,
   m.attributedBody,
   m.payload_data,
   m.date,
   m.is_from_me,
+  m.thread_originator_guid,
+  m.reply_to_guid,
   h.id         AS contact_id,
   c.rowid      AS chat_id,
   c.display_name,
@@ -53,6 +56,13 @@ class IMessageRow:
     chat_id: int | None
     display_name: str | None
     chat_identifier: str | None
+    # Reply-chain metadata. iMessage's explicit "reply to" feature populates
+    # thread_originator_guid on every message in the thread (pointing back at
+    # the root); reply_to_guid points at the immediate parent. We use these
+    # to bucket parallel threads instead of mixing them via sliding windows.
+    guid: str | None = None
+    thread_originator_guid: str | None = None
+    reply_to_guid: str | None = None
 
 
 def imessage_date_to_iso(ns: int) -> str:
@@ -125,7 +135,8 @@ def iter_messages(db_path: str | None = None) -> Iterator[IMessageRow]:
         cur = conn.cursor()
         cur.execute(MESSAGE_QUERY)
         for row in cur:
-            (row_id, text, attributed_body, payload_data, date_ns, is_from_me,
+            (row_id, guid, text, attributed_body, payload_data, date_ns, is_from_me,
+             thread_originator_guid, reply_to_guid,
              contact_id, chat_id, display_name, chat_identifier) = row
             if not text or not text.strip():
                 text = extract_text(attributed_body) or ""
@@ -147,6 +158,9 @@ def iter_messages(db_path: str | None = None) -> Iterator[IMessageRow]:
                 chat_id=chat_id,
                 display_name=display_name,
                 chat_identifier=chat_identifier,
+                guid=guid,
+                thread_originator_guid=thread_originator_guid,
+                reply_to_guid=reply_to_guid,
             )
     finally:
         conn.close()

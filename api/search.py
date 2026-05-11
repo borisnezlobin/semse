@@ -49,7 +49,37 @@ When you DO answer:
 - Senders are tagged "(new contact, not in address book)" when the user has never saved their number. For "who did I just meet?" / "who introduced themselves to me?" only count people with that tag — existing contacts saying "great to meet you" are not new acquaintances.
 - A "Known contacts in this excerpt set" block may appear above the excerpts. Those are pre-built relationship summaries (cluster-sampled across the user's history). Treat them as factual context. If the user asks "what's my relationship with X" or "what does X do" or similar, the summary IS the right answer — synthesize from it directly, don't refuse for lack of an excerpt that literally says it.
 
+SPEAKER ATTRIBUTION — CRITICAL:
+Each excerpt line is formatted "<SpeakerName>: <message text>". The speaker label IS authoritative — the prefix tells you exactly who wrote that line.
+- Lines starting with "Me:" are the USER's own words. Never attribute them to anyone else.
+- For questions like "what does X think about Y", "does X prefer A or B", "did X mention Z": count ONLY lines where the prefix is X. Lines prefixed "Me:" cannot answer questions about what X said, thought, or prefers — they're the user, not X.
+- If the excerpts only contain "Me:" lines on the topic (the user opining, the contact silent), stay silent. The user already knows what they themselves said.
+- When citing a fact, mentally check: "is the source line prefixed with the right speaker?" If not, do not include that fact.
+
 To stay silent, your entire response must be the empty string. Do not say "no answer", "EMPTY", "(nothing)", or anything else."""
+
+
+# Separate prompt used only when the query names a specific contact. The
+# excerpts are pre-filtered to ONLY that contact's lines — no user messages,
+# no other speakers. We use a tighter prompt here because the more complex
+# instructions in SYSTEM_PROMPT (with [EVIDENCE]/[CONTEXT] tagging rules)
+# kept confusing the model into attributing user words to the contact.
+CONTACT_FOCUSED_PROMPT = """You are analyzing what one specific person said, based on excerpts of their own messages.
+
+The excerpts contain ONLY the targeted person's own messages. The user's questions and opinions are NOT shown to you. Every line you see was sent BY the targeted person.
+
+How to answer (1–2 sentences):
+- Describe what the person seems to think/prefer/like by PARAPHRASING patterns across their messages. Mention concrete topics, attitudes, or recurring themes.
+- If you use double quotation marks ("…"), the text inside MUST appear verbatim in the messages below. A single fabricated quote invalidates the entire answer. When in doubt, paraphrase without quotes — that's always safe.
+- Apostrophes for possessives/contractions are fine. Single quotes around phrases (' … ') are not used for quotation here — use double quotes if you must quote.
+
+Empty-response cases:
+- If the messages don't contain enough information to answer, return an empty string.
+- Don't guess, don't extrapolate from the question itself, don't fill in plausible-sounding content.
+
+Output format:
+- 1–2 sentences. No preamble. No "Based on the messages…". No apologies. No restating the question.
+- To stay silent: return a literal empty string. Don't write "no answer" or anything similar."""
 
 RRF_K = 60  # standard reciprocal rank fusion constant
 FUSE_FETCH = 24  # how many candidates each retriever pulls before fusion
@@ -68,6 +98,41 @@ def _normalize_name(name: str) -> str:
     if not name:
         return ""
     return _NAME_NORM_RE.sub("", name.lower()).strip()
+
+
+def _filter_for_target_contacts(
+    messages: list[ChunkMessage],
+    target: set[str],
+) -> list[ChunkMessage]:
+    """Keep ONLY messages spoken by target contacts. No surrounding context.
+
+    Previous versions kept one preceding line for context, but the LLM kept
+    paraphrasing that preceding line as the contact's view. With user lines
+    gone entirely, there's nothing for it to mistakenly attribute. The
+    contact's tone, vocabulary, and topical pattern is still fully present
+    in their own messages."""
+    if not messages or not target:
+        return messages
+    return [m for m in messages if m.sender in target]
+
+
+# Tokens we never accept as a contact candidate in the fallback scan, even if
+# they happen to appear in the contact index. Keeps the heuristic from
+# attaching meaning to verbs/articles/etc that share spelling with nicknames.
+_CONTACT_QUERY_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "have", "has", "had", "of", "in", "on", "at", "to",
+    "for", "with", "and", "or", "but", "if", "then", "this", "that", "it",
+    "i", "me", "my", "we", "us", "our", "you", "your", "he", "she", "they",
+    "what", "who", "when", "where", "why", "how", "any", "some", "all",
+    "about", "from", "by", "as", "tell", "show", "find", "get", "got",
+    "say", "said", "ask", "asked", "think", "thought", "like", "likes",
+    "liked", "prefer", "prefers", "preferred", "want", "wants", "wanted",
+    "claude", "chatgpt", "gpt", "openai", "anthropic", "lockheed", "amazon",
+    "google", "microsoft", "stanford", "harvard", "mit", "berkeley",
+    "mail", "email", "text", "texts", "message", "messages", "picture",
+    "photo", "image", "pic",
+}
 
 
 def _best_message_index(messages: list[ChunkMessage], q_tokens: set[str]) -> int:
@@ -137,6 +202,29 @@ class SearchEngine:
                     if len(tok) >= 2:
                         index.setdefault(tok, set()).add(canonical)
         return index
+
+    def _extract_contacts_from_query(self, query: str) -> set[str]:
+        """Heuristic fallback when the LLM misses a contact name that's in
+        the query verbatim. We scan tokens (length >= 2) against the
+        normalized contact index. Stopwords are skipped so common words
+        don't accidentally resolve to a contact named e.g. "and"."""
+        if not query or not self._contact_norm_index:
+            return set()
+        tokens = _QUERY_TOKEN_RE.findall(query.lower())
+        # Filter out generic English stopwords + verbs that often appear
+        # alongside contact names. (Don't filter on length alone — short
+        # nicknames like "M" or "IL" exist in the user's index.)
+        tokens = [t for t in tokens if t not in _CONTACT_QUERY_STOPWORDS]
+        out: set[str] = set()
+        for t in tokens:
+            if t in self._contact_norm_index:
+                # Only accept tokens that map UNAMBIGUOUSLY (one canonical name)
+                # or where the token IS the full canonical name. Otherwise a
+                # common first name like "alex" could pull in many people.
+                candidates = self._contact_norm_index[t]
+                if len(candidates) == 1:
+                    out.update(candidates)
+        return out
 
     def _resolve_contacts(self, extracted: list[str]) -> set[str]:
         """Given LLM-extracted contact strings, return the set of canonical
@@ -368,6 +456,13 @@ class SearchEngine:
     async def search(self, req: SearchRequest) -> SearchResponse:
         t0 = time.perf_counter()
         intent = req.intent or QueryIntent()
+        if req.intent is not None:
+            print(
+                f"[search] query=\"{req.query}\" intent: topic=\"{intent.topic}\" "
+                f"sources={intent.sources} contacts={intent.contacts} "
+                f"attachment={intent.must_have_attachment}",
+                file=sys.stderr,
+            )
 
         # 1) Temporal stripping — independent of intent. We still want
         #    "yesterday" / "last week" detection on top of source filters.
@@ -385,6 +480,20 @@ class SearchEngine:
             resolved = self._resolve_contacts(intent.contacts)
             if resolved:
                 contact_filter = resolved
+        # Fallback: the on-device LLM sometimes misses contact names that
+        # are clearly in the query. Tokenize the raw query and pick up any
+        # tokens that map to a known canonical contact name.
+        fallback = self._extract_contacts_from_query(req.query)
+        if fallback:
+            if contact_filter is None:
+                contact_filter = fallback
+            else:
+                contact_filter = contact_filter | fallback
+            if not intent.contacts or not self._resolve_contacts(intent.contacts):
+                print(
+                    f"[search] fallback contact extraction added: {sorted(fallback)}",
+                    file=sys.stderr,
+                )
         # If the user explicitly asked for an image, treat image as the only
         # relevant source — text excerpts about a photo aren't what they want.
         if intent.must_have_attachment:
@@ -453,7 +562,7 @@ class SearchEngine:
             local = self._hydrate(fused, req.top_k, date_range=date_filter, query=embed_query)
 
         merged = self._merge_results(local, image_results, remote_results, max_total=req.top_k)
-        answer = await self._synthesize(req.query, merged, trange)
+        answer = await self._synthesize(req.query, merged, trange, target_contacts=contact_filter)
         return SearchResponse(
             answer=answer,
             sources=merged,
@@ -489,11 +598,26 @@ class SearchEngine:
         query: str,
         sources: list[SourceResult],
         trange: temporal.TemporalRange | None = None,
+        target_contacts: set[str] | None = None,
     ) -> str:
+        """Synthesize an answer from retrieved excerpts.
+
+        When `target_contacts` is non-empty, we route to a separate path that
+        feeds the LLM ONLY the contact's own lines and uses a focused prompt.
+        Past attempts kept the user's words in via labels and lost — the LLM
+        consistently leaked user opinions back as the contact's. The simpler
+        the input, the safer the output.
+        """
         if not sources or not os.getenv("OPENAI_API_KEY"):
             return ""
         if not _looks_like_question(query):
             return ""
+
+        if target_contacts:
+            return await self._synthesize_contact_focused(
+                query, sources, trange, target_contacts
+            )
+
         excerpts: list[str] = []
         for s in sources:
             who = ", ".join(s.contact_names) or "Unknown"
@@ -536,6 +660,7 @@ class SearchEngine:
         import datetime as _dt
         today = _dt.date.today().isoformat()
         date_note = f"Today is {today}."
+
         if trange:
             after = trange.after.date().isoformat() if trange.after else "?"
             before = trange.before.date().isoformat() if trange.before else "?"
@@ -558,6 +683,96 @@ class SearchEngine:
             # Defensive: if the model ignored instructions and returned a non-answer
             # placeholder, normalize back to an actual empty string.
             if _looks_like_non_answer(answer):
+                return ""
+            return answer
+        except Exception:
+            return ""
+
+    async def _synthesize_contact_focused(
+        self,
+        query: str,
+        sources: list[SourceResult],
+        trange: temporal.TemporalRange | None,
+        target_contacts: set[str],
+    ) -> str:
+        """Strict path: the LLM sees ONLY the targeted contacts' own messages.
+
+        No user lines, no other speakers, no [EVIDENCE]/[CONTEXT] labels —
+        the format is unmistakable: every line is a message the contact
+        sent. Pattern/tone inference is still encouraged by the prompt.
+        """
+        # Gather only the contact's lines across all sources, with light
+        # source headers so the model knows messages come from different
+        # threads/dates.
+        blocks: list[str] = []
+        total_lines = 0
+        for s in sources:
+            if not s.messages:
+                continue
+            contact_lines = _filter_for_target_contacts(s.messages, target_contacts)
+            if not contact_lines:
+                continue
+            date = (s.date_start or "")[:10]
+            chat = s.chat_title or ""
+            header_bits = [_label(s.source), date]
+            if chat:
+                header_bits.append(chat)
+            header = " · ".join(b for b in header_bits if b)
+            body = "\n".join(f"{m.sender}: {m.text}" for m in contact_lines)
+            blocks.append(f"[{header}]\n{body}")
+            total_lines += len(contact_lines)
+        if total_lines == 0:
+            # No contact-spoken lines in any excerpt — nothing to synthesize.
+            return ""
+
+        names = ", ".join(sorted(target_contacts))
+        context = "\n\n".join(blocks)
+
+        # Deliberately omit contact_summary here. The summary is the only
+        # other place where user-phrased content could reach the LLM in
+        # this path; keeping it out makes the input strictly the contact's
+        # own words, which is what the quote validator also checks against.
+
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+        date_note = f"Today is {today}."
+        if trange:
+            after = trange.after.date().isoformat() if trange.after else "?"
+            before = trange.before.date().isoformat() if trange.before else "?"
+            date_note += (
+                f" The query refers to '{trange.label}' (between {after} and {before}). "
+                f"Only use excerpts in that range."
+            )
+
+        user_content = (
+            f"{date_note}\n\n"
+            f"Query: {query}\n\n"
+            f"Messages from {names} (the only person/people whose words you can see):\n"
+            f"{context}"
+        )
+        try:
+            resp = await self._openai.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.0,
+                max_tokens=300,
+                messages=[
+                    {"role": "system", "content": CONTACT_FOCUSED_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+            if _looks_like_non_answer(answer):
+                return ""
+            # Strict guard against fabricated quotes. If the LLM puts text in
+            # quotation marks, that text MUST appear in the messages we sent
+            # — otherwise it's hallucinated and the whole answer is rejected.
+            ok, bad = _validate_no_invented_quotes(answer, context)
+            if not ok:
+                print(
+                    f"[synthesis] rejecting answer due to invented quote: "
+                    f"{bad!r}; returning empty",
+                    file=sys.stderr,
+                )
                 return ""
             return answer
         except Exception:
@@ -596,6 +811,42 @@ _NON_ANSWER_PATTERNS = (
     "(nothing)",
     "n/a",
 )
+
+
+# Only double-quote pairs count as a quotation for validation. Single quotes
+# / apostrophes are too ambiguous in English (possessives, contractions) to
+# treat as quote delimiters without false positives.
+_QUOTE_RE = re.compile(r'["“”]([^"“”\n]{2,120})["“”]')
+_NORMALIZE_QUOTE_RE = re.compile(r"\s+")
+
+
+def _normalize_for_compare(s: str) -> str:
+    # Lowercase, collapse whitespace, strip trailing/leading punctuation
+    # that the LLM might add when embedding a quote in its own sentence.
+    cleaned = _NORMALIZE_QUOTE_RE.sub(" ", s.lower()).strip()
+    return cleaned.strip(".,;:!?…\"'“”‘’ ")
+
+
+def _validate_no_invented_quotes(answer: str, allowed_text: str) -> tuple[bool, str | None]:
+    """Every quoted phrase in `answer` must appear (case-insensitively, with
+    whitespace collapsed, and ignoring surrounding punctuation) inside
+    `allowed_text`. Returns (ok, offending_quote).
+
+    Defense against gpt-4o-mini fabricating "alarm said 'so peak'" when those
+    words were never in the excerpts. A single fabricated quote rejects the
+    whole answer — the user gets nothing instead of misinformation.
+    """
+    haystack = _normalize_for_compare(allowed_text)
+    for m in _QUOTE_RE.finditer(answer):
+        quoted = m.group(1).strip()
+        if len(quoted) < 3:
+            continue
+        norm = _normalize_for_compare(quoted)
+        if not norm:
+            continue
+        if norm not in haystack:
+            return False, quoted
+    return True, None
 
 
 def _looks_like_non_answer(text: str) -> bool:

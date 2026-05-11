@@ -7,7 +7,7 @@ final class SpotlightPanel: NSPanel {
     let blurContainer: NSVisualEffectView
 
     init() {
-        let contentRect = NSRect(x: 0, y: 0, width: 720, height: 88)
+        let contentRect = NSRect(x: 0, y: 0, width: 720, height: 56)
 
         let blur = NSVisualEffectView(frame: contentRect)
         blur.material = .hudWindow
@@ -31,7 +31,8 @@ final class SpotlightPanel: NSPanel {
         self.backgroundColor = .clear
         self.hasShadow = true
         self.level = .floating
-        self.isMovableByWindowBackground = true
+        self.isMovableByWindowBackground = false
+        self.isMovable = false
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         self.hidesOnDeactivate = false
         self.isReleasedWhenClosed = false
