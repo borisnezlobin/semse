@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+
+# Env files (keep .env.example tracked)
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node / Next (not currently used; kept for safety)
+node_modules/
+.next/
+out/
+
+# Swift Package Manager build output
+app-mac/.build/
+app-mac/.swiftpm/
+app-mac/Package.resolved
+.build/
+.swiftpm/
+DerivedData/
+
+# IDE
+.idea/
+.vscode/
+
+# Indexer-generated data — personal content; rebuilds from source
+indexer/data/*.faiss
+indexer/data/*.db
+indexer/data/*.json
+indexer/data/contacts/
+
+# Logs / tmp
+*.log
+tmp/
+.tmp/
