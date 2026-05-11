@@ -167,8 +167,15 @@ def _find_emlx_for_row(emlx_index: dict[str, Path], row_id: int, remote_id: str 
     return emlx_index.get(str(row_id))
 
 
-def iter_mail_threads(limit: int | None = None) -> Iterator[list[MailMessage]]:
-    """Yield message-threads. Each thread is a list of MailMessage sorted by date."""
+def iter_mail_threads(
+    limit: int | None = None,
+    since_iso: str | None = None,
+) -> Iterator[list[MailMessage]]:
+    """Yield message-threads. Each thread is a list of MailMessage sorted by date.
+
+    `since_iso` (when set) skips messages with `date_iso <= since_iso` BEFORE
+    the expensive emlx parse + HTML strip. Used by `--update` indexing.
+    """
     mail_root = _find_mail_root()
     db_path = _envelope_index_path(mail_root)
     print(f"  building emlx file index from {mail_root}…")
@@ -221,6 +228,9 @@ def iter_mail_threads(limit: int | None = None) -> Iterator[list[MailMessage]]:
             sender_addr = row_dict.get("sender_raw") or ""
             if _is_newsletter_sender(sender_addr):
                 continue
+            date_iso = _ts_to_iso(row_dict.get("date_received"))
+            if since_iso and date_iso and date_iso <= since_iso:
+                continue
             emlx = _find_emlx_for_row(emlx_index, row_dict["row_id"], row_dict.get("remote_id"))
             if not emlx:
                 continue
@@ -239,7 +249,7 @@ def iter_mail_threads(limit: int | None = None) -> Iterator[list[MailMessage]]:
                     subject=str(row_dict.get("subject") or "").strip(),
                     sender=sender_addr,
                     recipients=recipients,
-                    date_iso=_ts_to_iso(row_dict.get("date_received")),
+                    date_iso=date_iso,
                     body=body,
                 )
             )

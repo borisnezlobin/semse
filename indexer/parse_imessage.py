@@ -73,6 +73,14 @@ def imessage_date_to_iso(ns: int) -> str:
     return datetime.datetime.utcfromtimestamp(unix_ts).isoformat()
 
 
+def iso_to_imessage_ns(iso: str) -> int:
+    """Inverse of imessage_date_to_iso — ISO 8601 string back to nanos-since-2001."""
+    dt = datetime.datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int((dt.timestamp() - MAC_EPOCH_OFFSET) * 1_000_000_000)
+
+
 _REACTION_PREFIXES = (
     "loved “", "liked “", "disliked “", "emphasized “",
     "questioned “", "laughed at “", "loved an image", "liked an image",
@@ -105,35 +113,60 @@ def _is_reaction_or_noise(text: str | None) -> bool:
     return False
 
 
-def copy_chat_db_to_temp() -> str:
-    """Copy chat.db (and -wal/-shm sidecar files) to a temp dir; return temp db path."""
+def copy_chat_db_to_temp() -> tuple[str, str]:
+    """Copy chat.db (and -wal/-shm sidecar files) to a fresh temp dir.
+
+    Returns `(db_path, tmp_dir)`. The caller MUST `shutil.rmtree(tmp_dir)` when
+    done — chat.db is ~800 MB and these copies accumulate fast across runs.
+    """
     if not CHAT_DB_PATH.exists():
         raise FileNotFoundError(f"chat.db not found at {CHAT_DB_PATH}")
     tmp_dir = tempfile.mkdtemp(prefix="semse_imessage_")
-    dest = Path(tmp_dir) / "chat.db"
-    shutil.copy2(CHAT_DB_PATH, dest)
-    for sidecar in ("chat.db-wal", "chat.db-shm"):
-        src = CHAT_DB_PATH.parent / sidecar
-        if src.exists():
-            shutil.copy2(src, Path(tmp_dir) / sidecar)
-    return str(dest)
+    try:
+        dest = Path(tmp_dir) / "chat.db"
+        shutil.copy2(CHAT_DB_PATH, dest)
+        for sidecar in ("chat.db-wal", "chat.db-shm"):
+            src = CHAT_DB_PATH.parent / sidecar
+            if src.exists():
+                shutil.copy2(src, Path(tmp_dir) / sidecar)
+    except BaseException:
+        # If the copy fails partway (e.g. ENOSPC), nuke the partial dir — we
+        # never returned it to the caller so nobody else will clean it up.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    return str(dest), tmp_dir
 
 
-def iter_messages(db_path: str | None = None) -> Iterator[IMessageRow]:
+def iter_messages(db_path: str | None = None, since_iso: str | None = None) -> Iterator[IMessageRow]:
     """Yield every iMessage row, sorted by chat then date ASC.
 
     Messages with NULL `text` but populated `attributedBody` (typically SMS from
     short-codes, edited messages, and reactions with content) are also recovered
     by extracting the inner NSString from the typedstream blob.
+
+    `since_iso` (when set) filters at SQL level — only rows strictly newer than
+    the cutoff are returned. Used by the additive `--update` indexing path so we
+    don't pay typedstream/link-preview cost on already-indexed messages.
     """
     from typedstream import extract_text  # local import to avoid circular deps
     from link_preview import extract as extract_link_preview
-    path = db_path or copy_chat_db_to_temp()
+    tmp_dir: str | None = None
+    if db_path:
+        path = db_path
+    else:
+        path, tmp_dir = copy_chat_db_to_temp()
     uri = f"file:{path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
         cur = conn.cursor()
-        cur.execute(MESSAGE_QUERY)
+        query = MESSAGE_QUERY
+        if since_iso:
+            since_ns = iso_to_imessage_ns(since_iso)
+            query = query.replace(
+                "ORDER BY chat_id, m.date ASC",
+                f"AND m.date > {since_ns}\nORDER BY chat_id, m.date ASC",
+            )
+        cur.execute(query)
         for row in cur:
             (row_id, guid, text, attributed_body, payload_data, date_ns, is_from_me,
              thread_originator_guid, reply_to_guid,
@@ -164,6 +197,8 @@ def iter_messages(db_path: str | None = None) -> Iterator[IMessageRow]:
             )
     finally:
         conn.close()
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def chat_label(row: IMessageRow) -> str:

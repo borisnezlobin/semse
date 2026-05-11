@@ -9,6 +9,7 @@ Used by the indexer to embed images into a CLIP FAISS index alongside text.
 """
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,7 +77,11 @@ def iter_image_attachments(
     resolver: ContactResolver | None = None,
 ) -> Iterator[ImageAttachment]:
     from typedstream import extract_text  # avoid circular
-    path = db_path or copy_chat_db_to_temp()
+    tmp_dir: str | None = None
+    if db_path:
+        path = db_path
+    else:
+        path, tmp_dir = copy_chat_db_to_temp()
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         for row in conn.execute(ATTACHMENT_QUERY):
@@ -121,6 +126,8 @@ def iter_image_attachments(
             )
     finally:
         conn.close()
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

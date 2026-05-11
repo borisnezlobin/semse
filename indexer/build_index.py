@@ -128,14 +128,20 @@ def _collect_chunks(
     sources: set[str],
     resolver: ContactResolver,
     embedder: Embedder | None = None,
+    cutoffs: dict[str, str] | None = None,
 ) -> list[Chunk]:
     from me_identity import discover as discover_me
     user_emails, _ = discover_me()
     print(f"  user identified by {len(user_emails)} email(s)", file=sys.stderr)
+    cutoffs = cutoffs or {}
     chunks: list[Chunk] = []
     if "imessage" in sources:
-        print("Parsing iMessage…", file=sys.stderr)
-        rows = list(iter_messages())
+        cutoff = cutoffs.get("imessage")
+        if cutoff:
+            print(f"Parsing iMessage (since {cutoff})…", file=sys.stderr)
+        else:
+            print("Parsing iMessage…", file=sys.stderr)
+        rows = list(iter_messages(since_iso=cutoff))
         print(f"  {len(rows):,} messages", file=sys.stderr)
         # Pass the embedder through so chunk_imessages can use it for the
         # ambient-bucket cohesion segmentation.
@@ -143,10 +149,14 @@ def _collect_chunks(
         print(f"  → {len(ic):,} chunks", file=sys.stderr)
         chunks.extend(ic)
     if "mail" in sources:
-        print("Parsing Apple Mail…", file=sys.stderr)
+        cutoff = cutoffs.get("mail")
+        if cutoff:
+            print(f"Parsing Apple Mail (since {cutoff})…", file=sys.stderr)
+        else:
+            print("Parsing Apple Mail…", file=sys.stderr)
         try:
             from parse_mail import iter_mail_threads
-            threads = list(iter_mail_threads())
+            threads = list(iter_mail_threads(since_iso=cutoff))
             print(f"  {len(threads):,} threads", file=sys.stderr)
             mc = list(chunk_mail_threads(threads, resolver=resolver, user_emails=user_emails))
             print(f"  → {len(mc):,} chunks", file=sys.stderr)
@@ -154,6 +164,23 @@ def _collect_chunks(
         except FileNotFoundError as e:
             print(f"  skipping mail: {e}", file=sys.stderr)
     return chunks
+
+
+def _read_cutoffs(meta_path: Path, sources: set[str]) -> dict[str, str]:
+    """For each source in `sources`, return its max date_end already indexed."""
+    if not meta_path.exists():
+        return {}
+    conn = sqlite3.connect(meta_path)
+    try:
+        cur = conn.execute(
+            "SELECT source, MAX(date_end) FROM chunks "
+            "WHERE source IN (" + ",".join("?" * len(sources)) + ") "
+            "GROUP BY source",
+            tuple(sources),
+        )
+        return {src: max_date for src, max_date in cur.fetchall() if max_date}
+    finally:
+        conn.close()
 
 
 def _build_image_index(resolver: ContactResolver, conn: sqlite3.Connection) -> int:
@@ -222,8 +249,13 @@ def _build_image_index(resolver: ContactResolver, conn: sqlite3.Connection) -> i
     return matrix.shape[0]
 
 
-def build(sources: set[str]) -> None:
+def build(sources: set[str], update: bool = False) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    text_sources = sources - {"images"}
+    if update and not (INDEX_PATH.exists() and META_DB_PATH.exists() and ID_MAP_PATH.exists()):
+        print("--update requested but existing index files are missing; doing a full build instead.", file=sys.stderr)
+        update = False
 
     print("Loading Contacts…", file=sys.stderr)
     resolver = ContactResolver()
@@ -232,9 +264,19 @@ def build(sources: set[str]) -> None:
     n_photos = resolver.export_photos()
     print(f"  exported {n_photos:,} photos", file=sys.stderr)
 
-    do_text = bool(sources - {"images"})
+    do_text = bool(text_sources)
     do_images = "images" in sources
     n_images = 0
+
+    cutoffs: dict[str, str] = {}
+    if update and do_text:
+        cutoffs = _read_cutoffs(META_DB_PATH, text_sources)
+        for src in text_sources:
+            cutoff = cutoffs.get(src)
+            if cutoff:
+                print(f"  {src} watermark: {cutoff} (only newer rows will be added)", file=sys.stderr)
+            else:
+                print(f"  {src} has no existing chunks — will index everything", file=sys.stderr)
 
     if do_text:
         # Construct the embedder up front so it can be reused by both the
@@ -242,13 +284,43 @@ def build(sources: set[str]) -> None:
         # text embedding pass below — avoids loading the model twice.
         print(f"Loading embedder (all-MiniLM-L6-v2)…", file=sys.stderr)
         embedder = Embedder()
-        chunks = _collect_chunks(sources - {"images"}, resolver, embedder=embedder)
+        chunks = _collect_chunks(text_sources, resolver, embedder=embedder, cutoffs=cutoffs)
         if not chunks:
             print("No text chunks produced.", file=sys.stderr)
+            if do_images:
+                conn = _init_metadata_db(META_DB_PATH)
+                n_images = _build_image_index(resolver, conn)
+                conn.close()
+                print(f"\n=== Image index built ===\n  {n_images:,} images embedded", file=sys.stderr)
+            return
+        print(f"Embedding {len(chunks):,} chunks…", file=sys.stderr)
+        texts = [c.text for c in chunks]
+        vectors = embedder.embed_batch(texts).astype("float32")
+
+        if update:
+            print("Appending to existing FAISS index…", file=sys.stderr)
+            index = faiss.read_index(str(INDEX_PATH))
+            before = index.ntotal
+            index.add(vectors)
+            faiss.write_index(index, str(INDEX_PATH))
+            print(f"  {before:,} → {index.ntotal:,} vectors", file=sys.stderr)
+
+            conn = sqlite3.connect(META_DB_PATH)
+            # Make sure the schema is present in case the existing db predates
+            # any later additions (FTS table, images table). Idempotent.
+            conn.close()
+            conn = _init_metadata_db(META_DB_PATH)
+            BATCH = 500
+            for i in tqdm(range(0, len(chunks), BATCH), desc="metadata"):
+                _persist_chunks(conn, chunks[i : i + BATCH])
+            existing_ids = json.loads(ID_MAP_PATH.read_text())
+            existing_ids.extend(c.chunk_id for c in chunks)
+            ID_MAP_PATH.write_text(json.dumps(existing_ids))
+
+            if do_images:
+                n_images = _build_image_index(resolver, conn)
+            conn.close()
         else:
-            print(f"Embedding {len(chunks):,} chunks…", file=sys.stderr)
-            texts = [c.text for c in chunks]
-            vectors = embedder.embed_batch(texts).astype("float32")
             print("Building text FAISS index…", file=sys.stderr)
             index = _build_faiss(vectors)
             faiss.write_index(index, str(INDEX_PATH))
@@ -286,22 +358,24 @@ def build(sources: set[str]) -> None:
 
             if do_images:
                 n_images = _build_image_index(resolver, conn)
-
             conn.close()
 
-            counts: dict[str, int] = {}
-            for c in chunks:
-                counts[c.source] = counts.get(c.source, 0) + 1
-            print("\n=== Index built ===", file=sys.stderr)
-            for s, n in counts.items():
-                print(f"  {s:<10} {n:,} chunks", file=sys.stderr)
-            if n_images:
-                print(f"  images    {n_images:,} embedded", file=sys.stderr)
-            print(f"  TOTAL    {len(chunks):,} text chunks + {n_images:,} images", file=sys.stderr)
-            print(f"  text idx  {INDEX_PATH.stat().st_size / 1024 / 1024:.1f} MB", file=sys.stderr)
-            if IMAGE_INDEX_PATH.exists():
-                print(f"  image idx {IMAGE_INDEX_PATH.stat().st_size / 1024 / 1024:.1f} MB", file=sys.stderr)
-            print(f"  metadata  {META_DB_PATH.stat().st_size / 1024 / 1024:.1f} MB", file=sys.stderr)
+        counts: dict[str, int] = {}
+        for c in chunks:
+            counts[c.source] = counts.get(c.source, 0) + 1
+        header = "Index updated" if update else "Index built"
+        print(f"\n=== {header} ===", file=sys.stderr)
+        for s, n in counts.items():
+            label = "added" if update else "chunks"
+            print(f"  {s:<10} {n:,} {label}", file=sys.stderr)
+        if n_images:
+            print(f"  images    {n_images:,} embedded", file=sys.stderr)
+        total_label = "added" if update else "text chunks"
+        print(f"  TOTAL    {len(chunks):,} {total_label} + {n_images:,} images", file=sys.stderr)
+        print(f"  text idx  {INDEX_PATH.stat().st_size / 1024 / 1024:.1f} MB", file=sys.stderr)
+        if IMAGE_INDEX_PATH.exists():
+            print(f"  image idx {IMAGE_INDEX_PATH.stat().st_size / 1024 / 1024:.1f} MB", file=sys.stderr)
+        print(f"  metadata  {META_DB_PATH.stat().st_size / 1024 / 1024:.1f} MB", file=sys.stderr)
     elif do_images:
         # Image-only build: keep existing text index & metadata, just (re)build images.
         if not META_DB_PATH.exists():
@@ -332,8 +406,15 @@ def main() -> None:
         action="store_true",
         help="Build/refresh per-contact relationship summaries (LLM, ~1¢)",
     )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Additive build: keep the existing index/metadata.db and only index "
+             "messages newer than the latest chunk per source. Falls back to a full "
+             "build if no existing index is found.",
+    )
     args = parser.parse_args()
-    build(set(args.sources))
+    build(set(args.sources), update=args.update)
     if args.summaries:
         _build_contact_summaries()
 

@@ -99,17 +99,21 @@ def _fallback_scan(data: bytes) -> str | None:
 
 if __name__ == "__main__":
     # Quick smoke test against chat.db.
-    import sqlite3, sys
+    import shutil, sqlite3, sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
     from parse_imessage import copy_chat_db_to_temp, imessage_date_to_iso
-    db = copy_chat_db_to_temp()
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    rows = conn.execute(
-        "SELECT date, attributedBody FROM message "
-        "WHERE (text IS NULL OR length(trim(text))=0) AND attributedBody IS NOT NULL "
-        "ORDER BY date DESC LIMIT 20"
-    )
-    for date_ns, body in rows:
-        text = extract_text(body)
-        print(f"{imessage_date_to_iso(date_ns)[:19]}  →  {text!r}")
+    db, tmp_dir = copy_chat_db_to_temp()
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT date, attributedBody FROM message "
+            "WHERE (text IS NULL OR length(trim(text))=0) AND attributedBody IS NOT NULL "
+            "ORDER BY date DESC LIMIT 20"
+        )
+        for date_ns, body in rows:
+            text = extract_text(body)
+            print(f"{imessage_date_to_iso(date_ns)[:19]}  →  {text!r}")
+        conn.close()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

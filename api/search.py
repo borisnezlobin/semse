@@ -451,6 +451,43 @@ class SearchEngine:
                 break
         return out
 
+    def _rerank_by_contact_similarity(
+        self,
+        sources: list[SourceResult],
+        target_contacts: set[str],
+        query: str,
+        top_k: int,
+    ) -> list[SourceResult]:
+        """For each source, embed only the contact's lines and score against
+        the query. Sort descending by that score, then truncate to top_k.
+
+        Solves the failure mode where a chunk dominated by the USER talking
+        about a topic outranks a chunk where the CONTACT actually spoke on
+        it. We retain the contact_summaries semantics (chunks where the
+        contact never spoke are already filtered out earlier).
+        """
+        contact_texts: list[str] = []
+        for s in sources:
+            lines = [
+                m.text for m in (s.messages or [])
+                if m.sender in target_contacts and (m.text or "").strip()
+            ]
+            contact_texts.append("\n".join(lines))
+        # If a source has no contact lines at all, give it a low fallback
+        # score — it shouldn't surface above sources where the contact
+        # actually spoke.
+        non_empty_idx = [i for i, t in enumerate(contact_texts) if t.strip()]
+        if not non_empty_idx:
+            return sources[:top_k]
+        valid_texts = [contact_texts[i] for i in non_empty_idx]
+        query_vec = self.embedder.embed_one(query).astype("float32")
+        text_vecs = self.embedder.embed_batch(valid_texts).astype("float32")
+        scores: list[float] = [-1.0] * len(sources)
+        for vi, src_i in enumerate(non_empty_idx):
+            scores[src_i] = float(np.dot(query_vec, text_vecs[vi]))
+        ordered = sorted(range(len(sources)), key=lambda i: -scores[i])
+        return [sources[i] for i in ordered[:top_k]]
+
     # -- Public --
 
     async def search(self, req: SearchRequest) -> SearchResponse:
@@ -529,14 +566,29 @@ class SearchEngine:
         else:
             fused = self._rrf(dense_ids, fts_ids)
 
+        # When contact-filtered, over-hydrate so we have enough material to
+        # re-rank by contact-only similarity below; otherwise the top-K cut
+        # before re-ranking can already discard the chunks where the contact
+        # actually spoke about the topic.
+        hydrate_k = req.top_k * 4 if contact_filter is not None else req.top_k
         local = self._hydrate(
             fused,
-            req.top_k,
+            hydrate_k,
             date_range=date_filter,
             query=embed_query,
             source_filter=source_filter,
             contact_filter=contact_filter,
         )
+        # Re-rank by similarity of the contact's OWN lines to the query. The
+        # default FAISS/FTS ranking scores the whole chunk, which lets a
+        # chunk dominated by the USER's monologue about a topic outrank a
+        # chunk where the contact actually spoke on it. We re-score using
+        # only contact-spoken text, then truncate to top_k.
+        if contact_filter is not None and local:
+            local = await asyncio.to_thread(
+                self._rerank_by_contact_similarity,
+                local, contact_filter, embed_query, req.top_k,
+            )
         if date_filter:
             after_iso, before_iso = date_filter
             image_results = [
@@ -763,17 +815,24 @@ class SearchEngine:
             answer = (resp.choices[0].message.content or "").strip()
             if _looks_like_non_answer(answer):
                 return ""
-            # Strict guard against fabricated quotes. If the LLM puts text in
-            # quotation marks, that text MUST appear in the messages we sent
-            # — otherwise it's hallucinated and the whole answer is rejected.
+            # Quote integrity check: if the LLM put text in double quotes,
+            # that text must appear verbatim in the messages we sent.
+            # When the LLM paraphrases-in-quotes (e.g. "claude swore" when
+            # the source has "did claude swear??"), we'd rather salvage the
+            # paraphrase than return nothing — strip the offending quote
+            # marks, leaving the paraphrase inline. The user still gets a
+            # useful answer plus the underlying source cards.
             ok, bad = _validate_no_invented_quotes(answer, context)
             if not ok:
                 print(
-                    f"[synthesis] rejecting answer due to invented quote: "
-                    f"{bad!r}; returning empty",
+                    f"[synthesis] stripping invented quote {bad!r} from answer",
                     file=sys.stderr,
                 )
-                return ""
+                answer = _strip_invented_quote_marks(answer, context)
+                # If after stripping the answer is empty or only punctuation,
+                # there was nothing of substance beyond the fake quote.
+                if not answer.strip(" .,;:!?\"'“”‘’()[]"):
+                    return ""
             return answer
         except Exception:
             return ""
@@ -825,6 +884,22 @@ def _normalize_for_compare(s: str) -> str:
     # that the LLM might add when embedding a quote in its own sentence.
     cleaned = _NORMALIZE_QUOTE_RE.sub(" ", s.lower()).strip()
     return cleaned.strip(".,;:!?…\"'“”‘’ ")
+
+
+def _strip_invented_quote_marks(answer: str, allowed_text: str) -> str:
+    """For each double-quoted phrase in `answer`, if it's not verbatim in
+    `allowed_text`, remove the surrounding quote marks (keep the text).
+    Real verbatim quotes are preserved."""
+    haystack = _normalize_for_compare(allowed_text)
+
+    def repl(m: re.Match) -> str:
+        inner = m.group(1)
+        norm = _normalize_for_compare(inner)
+        if norm and norm in haystack:
+            return m.group(0)  # real quote — keep as-is
+        return inner  # strip the quote marks, keep the content
+
+    return _QUOTE_RE.sub(repl, answer)
 
 
 def _validate_no_invented_quotes(answer: str, allowed_text: str) -> tuple[bool, str | None]:

@@ -105,17 +105,21 @@ def _looks_like_internal_id(s: str) -> bool:
 
 
 if __name__ == "__main__":
-    import sqlite3, sys
+    import shutil, sqlite3, sys
     sys.path.insert(0, ".")
     from parse_imessage import copy_chat_db_to_temp, imessage_date_to_iso
-    db = copy_chat_db_to_temp()
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    rows = conn.execute(
-        "SELECT date, text, payload_data FROM message "
-        "WHERE payload_data IS NOT NULL ORDER BY date DESC LIMIT 10"
-    )
-    for date_ns, text, payload in rows:
-        lp = extract(payload)
-        if lp:
-            print(f"{imessage_date_to_iso(date_ns)[:19]}  text={(text or '')[:30]!r}")
-            print(f"  → {lp.as_text()[:200]}")
+    db, tmp_dir = copy_chat_db_to_temp()
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT date, text, payload_data FROM message "
+            "WHERE payload_data IS NOT NULL ORDER BY date DESC LIMIT 10"
+        )
+        for date_ns, text, payload in rows:
+            lp = extract(payload)
+            if lp:
+                print(f"{imessage_date_to_iso(date_ns)[:19]}  text={(text or '')[:30]!r}")
+                print(f"  → {lp.as_text()[:200]}")
+        conn.close()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
