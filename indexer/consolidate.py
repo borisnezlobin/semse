@@ -32,11 +32,14 @@ import memory_store as store
 
 METADATA_DB_PATH = store.DATA_DIR / "metadata.db"
 
-# Threads skipped by a default scan — set SEMSE_EXCLUDED_THREADS to a comma-separated
-# list of thread keys. Kept out of source so no personal handle lives in the repo.
-EXCLUDED_THREAD_KEYS = {
-    t.strip() for t in os.environ.get("SEMSE_EXCLUDED_THREADS", "").split(",") if t.strip()
-}
+
+def _excluded_thread_keys() -> set[str]:
+    """Threads a default scan skips — SEMSE_EXCLUDED_THREADS, comma-separated.
+
+    Read on call, not at import: the value usually arrives from api/.env, which
+    _load_openai_env() only loads once a command is already running."""
+    raw = os.environ.get("SEMSE_EXCLUDED_THREADS", "")
+    return {t.strip() for t in raw.split(",") if t.strip()}
 
 
 def _load_openai_env() -> None:
@@ -77,7 +80,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
         else:
             threads = [tk for tk, _ in _thread_keys_by_size(METADATA_DB_PATH)]
             if not args.include_all_threads:
-                threads = [t for t in threads if t not in EXCLUDED_THREAD_KEYS]
+                excluded = _excluded_thread_keys()
+                threads = [t for t in threads if t not in excluded]
         failures = 0
         for tk in threads:
             print(f"scanning {tk} ...", flush=True)
@@ -567,6 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _load_openai_env()  # also supplies SEMSE_EXCLUDED_THREADS to every subcommand
     args = build_parser().parse_args()
     args.func(args)
 
