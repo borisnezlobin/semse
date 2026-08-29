@@ -15,6 +15,7 @@ from tqdm import tqdm
 from chunker import Chunk, chunk_imessages, chunk_mail_threads
 from contacts import ContactResolver
 from embedder import EMBED_DIM, Embedder
+from memory_store import refresh_rowid_chunk_map
 from parse_imessage import iter_messages
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -42,11 +43,14 @@ def _init_metadata_db(path: Path) -> sqlite3.Connection:
             row_ids TEXT,
             messages TEXT,
             subject TEXT,
-            chat_title TEXT
+            chat_title TEXT,
+            thread_key TEXT,
+            context TEXT
         )
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_thread_key ON chunks(thread_key)")
     conn.execute(
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -90,14 +94,16 @@ def _persist_chunks(conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
             json.dumps([asdict(m) for m in c.messages]),
             c.subject,
             c.chat_title,
+            c.thread_key,
+            c.context,
         )
         for c in chunks
     ]
     conn.executemany(
         """
         INSERT OR REPLACE INTO chunks
-        (chunk_id, source, contact_names, date_start, date_end, text, row_ids, messages, subject, chat_title)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (chunk_id, source, contact_names, date_start, date_end, text, row_ids, messages, subject, chat_title, thread_key, context)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -376,6 +382,13 @@ def build(sources: set[str], update: bool = False) -> None:
         if IMAGE_INDEX_PATH.exists():
             print(f"  image idx {IMAGE_INDEX_PATH.stat().st_size / 1024 / 1024:.1f} MB", file=sys.stderr)
         print(f"  metadata  {META_DB_PATH.stat().st_size / 1024 / 1024:.1f} MB", file=sys.stderr)
+
+        # Regenerate the (source, row_id) → chunk_id map in memory.db. chunk_ids are
+        # fresh each rebuild while row_ids are durable, so downstream state keys on
+        # row_ids and reaches the current chunk through this map.
+        print("Refreshing rowid → chunk map…", file=sys.stderr)
+        n_map = refresh_rowid_chunk_map(META_DB_PATH)
+        print(f"  rowid_chunk_map  {n_map:,} rows", file=sys.stderr)
     elif do_images:
         # Image-only build: keep existing text index & metadata, just (re)build images.
         if not META_DB_PATH.exists():

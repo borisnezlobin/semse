@@ -42,6 +42,11 @@ class Chunk:
     messages: list[ChunkMessage] = field(default_factory=list)
     subject: str | None = None         # mail-only: thread subject for header
     chat_title: str | None = None      # imessage-only: group chat name when present
+    # Canonical thread this chunk belongs to: "im:<conversation_key>" for iMessage,
+    # "mail:<thread_id>" for mail. Stitches a thread's chunks back into order for the
+    # consolidation scan; survives rebuilds because it's derived from durable keys.
+    thread_key: str | None = None
+    context: str | None = None         # block-level situational header, filled by later phases
 
 
 def _new_id() -> str:
@@ -85,6 +90,7 @@ def _build_chunk_from_rows(
             )
         )
     participants = sorted({m.sender for m in structured if not m.is_from_me})
+    conv_key = rows[0].conversation_key
     return Chunk(
         chunk_id=_new_id(),
         source="imessage",
@@ -95,6 +101,7 @@ def _build_chunk_from_rows(
         row_ids=[r.row_id for r in rows],
         messages=structured,
         chat_title=title,
+        thread_key=f"im:{conv_key}" if conv_key else None,
     )
 
 
@@ -189,7 +196,7 @@ def chunk_imessages(
 ) -> Iterator[Chunk]:
     """Thread-aware chunker for iMessage.
 
-    Within each chat_id (rows already arrive sorted by chat then date):
+    Within each conversation_key (rows already arrive sorted by conversation then date):
       1. Bucket by `thread_originator_guid`: each non-NULL value names a
          distinct explicit reply thread. The originator message itself joins
          the thread it spawned when its guid matches an originator-guid value.
@@ -200,13 +207,14 @@ def chunk_imessages(
          running centroid stays above COHESION_THRESHOLD, then split. Cap at
          THREAD_CHUNK_CAP messages.
     """
-    current_chat: int | None = None
+    current_key: str | None = None
     buffer: list[IMessageRow] = []
-    chat_title: str | None = None
 
-    def flush_chat(chat_buf: list[IMessageRow], title: str | None) -> Iterator[Chunk]:
+    def flush_chat(chat_buf: list[IMessageRow]) -> Iterator[Chunk]:
         if not chat_buf:
             return
+        # A group chat's name lives on its rows' display_name; 1:1 rows carry none.
+        title = next((r.display_name for r in chat_buf if r.display_name), None)
 
         # 1. Identify which guids appear as originator-guids inside this chat.
         thread_keys = {r.thread_originator_guid for r in chat_buf if r.thread_originator_guid}
@@ -247,17 +255,15 @@ def chunk_imessages(
                 yield from _split_oversized(seg_rows, title, resolver)
 
     for row in rows:
-        if current_chat is None:
-            current_chat = row.chat_id
-            chat_title = row.display_name
-        if row.chat_id != current_chat:
-            yield from flush_chat(buffer, chat_title)
+        if current_key is None:
+            current_key = row.conversation_key
+        if row.conversation_key != current_key:
+            yield from flush_chat(buffer)
             buffer = []
-            current_chat = row.chat_id
-            chat_title = row.display_name
+            current_key = row.conversation_key
         buffer.append(row)
 
-    yield from flush_chat(buffer, chat_title)
+    yield from flush_chat(buffer)
 
 
 @dataclass
@@ -350,6 +356,7 @@ def _build_mail_chunk(
         )
         if name not in senders and not is_me:
             senders.append(name)
+    thread_id = messages[0].thread_id
     return Chunk(
         chunk_id=_new_id(),
         source="mail",
@@ -360,6 +367,7 @@ def _build_mail_chunk(
         row_ids=[m.row_id for m in messages],
         messages=structured,
         subject=messages[0].subject or None,
+        thread_key=f"mail:{thread_id}" if thread_id else None,
     )
 
 
@@ -378,6 +386,7 @@ if __name__ == "__main__":
             chat_id=1,
             display_name=None,
             chat_identifier="+15551234567",
+            conversation_key="+15551234567",
         )
         for i in range(35)
     ]

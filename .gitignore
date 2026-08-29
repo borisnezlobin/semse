@@ -30,11 +30,15 @@ DerivedData/
 .idea/
 .vscode/
 
-# Indexer-generated data — personal content; rebuilds from source
-indexer/data/*.faiss
-indexer/data/*.db
-indexer/data/*.json
-indexer/data/contacts/
+# Indexer-generated data — personal content; rebuilds from source.
+# Whole tree, so subdirectories (backups, scratch runs) can't leak either.
+indexer/data/
+
+# Eval data mined from the real corpus — contains real names, dates and facts.
+# The runner and the fabricated fixtures are tracked; these two are not.
+evals/golden_queries.yaml
+evals/baselines.json
+evals/control_queries.yaml
 
 # Logs / tmp
 *.log

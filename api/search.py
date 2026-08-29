@@ -15,7 +15,26 @@ import numpy as np
 from openai import AsyncOpenAI
 
 from . import hyperspell, temporal
-from .models import ChunkMessage, QueryIntent, SearchRequest, SearchResponse, SourceResult
+from .entities import (
+    CLAIM_CURRENT,
+    CLAIM_EXPIRED,
+    CLAIM_SUPERSEDED,
+    AggregateResult,
+    EntityDossier,
+    EntityLayer,
+    LinkedEntity,
+    LinkResult,
+    detect_aggregate_operator,
+    log_link,
+)
+from .models import (
+    ChunkMessage,
+    LinkedEntitySummary,
+    QueryIntent,
+    SearchRequest,
+    SearchResponse,
+    SourceResult,
+)
 
 INDEXER_DIR = Path(__file__).resolve().parent.parent / "indexer"
 sys.path.insert(0, str(INDEXER_DIR))
@@ -27,6 +46,18 @@ META_DB_PATH = DATA_DIR / "metadata.db"
 ID_MAP_PATH = DATA_DIR / "id_map.json"
 IMAGE_INDEX_PATH = DATA_DIR / "images.faiss"
 IMAGE_ID_MAP_PATH = DATA_DIR / "image_id_map.json"
+MEMORY_DB_PATH = DATA_DIR / "memory.db"
+
+# Dossier sentinel the Phase 7 generator emits when an entity's claims are too thin
+# to summarize — never surfaced as a relationship summary.
+_DOSSIER_TOO_THIN = "Insufficient claims."
+
+
+def _memory_db_path() -> Path:
+    """Effective memory.db path. `SEMSE_MEMORY_DB` overrides it (evals point the
+    loader at a dev-slice store), matching api.entities' convention."""
+    override = os.getenv("SEMSE_MEMORY_DB")
+    return Path(override) if override else MEMORY_DB_PATH
 
 OPENAI_MODEL = "gpt-4o-mini"
 
@@ -56,6 +87,22 @@ Each excerpt line is formatted "<SpeakerName>: <message text>". The speaker labe
 - If the excerpts only contain "Me:" lines on the topic (the user opining, the contact silent), stay silent. The user already knows what they themselves said.
 - When citing a fact, mentally check: "is the source line prefixed with the right speaker?" If not, do not include that fact.
 
+TIME AND CHANGE:
+- The current date is given to you. A bounded state whose end has already passed relative to that date is NOT still true — report it as a transition that has since completed ("she said she'd be back July 15, so she should be home by now"), never as present-tense fact.
+- When a newer excerpt contradicts an older dated one, trust the most recent evidence and say what changed ("was going to rent the blue house, but signed the lease on the gray one in March").
+
+KNOWN ENTITIES:
+A "Known entities" block may appear above the excerpts — consolidated facts about the people or things the query names, drawn from the user's whole history. Trust them as factual context (like the Known-contacts summaries). Each fact carries a SERVER-COMPUTED status; obey it literally, never re-judge the dates yourself:
+- CURRENT — believed true now. Safe to state in the present tense.
+- EXPIRED — a bounded state whose end date has already passed. Report it as a completed transition ("was in China until July 15, so he should be back by now"), NEVER as present-tense fact. When the question is a present-state one ("where is X", "is X still Y"), the EXPIRED facts ARE the answer — lead with the transition.
+- SUPERSEDED — old history, replaced by a newer fact. Ignore it unless the question is explicitly about when something changed.
+A fact tagged "(you said this, not them)" was asserted by the USER, not by the named person — it is not that person confirming anything.
+
+Some queries also carry a one-line note before the excerpts:
+- SELF-QUERY: the question is about the user themselves. Here the "Me:" lines ARE the evidence — use them (this overrides the rule above about discarding "Me:" lines).
+- NO REPLY ON RECORD: the named person never responded. Say they did not reply; do not read the user's own outreach ("you expressed interest") as their confirmation.
+- MULTIPLE CANDIDATES: the name is ambiguous. Present the leading candidates; never silently pick one.
+
 To stay silent, your entire response must be the empty string. Do not say "no answer", "EMPTY", "(nothing)", or anything else."""
 
 
@@ -76,6 +123,13 @@ How to answer (1–2 sentences):
 Empty-response cases:
 - If the messages don't contain enough information to answer, return an empty string.
 - Don't guess, don't extrapolate from the question itself, don't fill in plausible-sounding content.
+
+Time and change:
+- The current date is given to you. A bounded state whose end date has already passed is no longer current — describe it as a transition that has completed ("she said she'd be back by the 15th, so she should be home now"), not as the present.
+- When later messages update an earlier stated fact, go with the most recent and mention that it changed.
+
+Background facts:
+- A "Background facts" block may appear before the messages. Those are consolidated facts about the person from the user's history, for context ONLY. They are NOT the person's words — never put any of that text in quotation marks. Quote only from the messages themselves.
 
 Output format:
 - 1–2 sentences. No preamble. No "Based on the messages…". No apologies. No restating the question.
@@ -171,6 +225,9 @@ class SearchEngine:
             self.image_id_map = json.loads(IMAGE_ID_MAP_PATH.read_text())
         self._contact_summaries: dict[str, dict] = self._load_contact_summaries()
         self._contact_norm_index: dict[str, set[str]] = self._build_contact_norm_index()
+        # Phase 5 entity layer. None when disabled (SEMSE_ENTITY_LAYER=0) or
+        # memory.db is absent — in which case the pipeline is byte-identical.
+        self.entity_layer = EntityLayer.load()
 
     def _build_contact_norm_index(self) -> dict[str, set[str]]:
         """Map normalized name token → set of canonical contact names that
@@ -255,6 +312,20 @@ class SearchEngine:
         return resolved
 
     def _load_contact_summaries(self) -> dict[str, dict]:
+        """Relationship summaries keyed by contact display name.
+
+        Primary source is per-entity dossiers in memory.db (Phase 7): a
+        contact-linked entity's claim-derived `summary`, surfaced under every
+        display-name label bound to it. The legacy contact_summaries table fills
+        any name a dossier doesn't cover. Returns {} when neither source exists —
+        the legacy table was dropped in the Phase 0 rebuild and dossiers may not
+        be generated yet — so this stays a byte-identical no-op until dossiers land.
+        """
+        summaries = self._load_legacy_contact_summaries()
+        summaries.update(self._load_entity_dossiers())  # dossiers win over legacy rows
+        return summaries
+
+    def _load_legacy_contact_summaries(self) -> dict[str, dict]:
         with self._open_db() as conn:
             try:
                 rows = conn.execute(
@@ -273,6 +344,96 @@ class SearchEngine:
                 "last": (r["last_message_iso"] or "")[:10],
             }
         return out
+
+    def _load_entity_dossiers(self) -> dict[str, dict]:
+        """Contact-linked entity dossiers from memory.db, keyed by every display
+        name bound to the entity. Activity stats are computed from chunks (as the
+        legacy builder did). Absent db/table/dossiers → {} (graceful no-op)."""
+        path = _memory_db_path()
+        if not path.exists():
+            return {}
+        # Read-only (mode=ro) so this never mutates or contends with the offline
+        # consolidation scan, which may be writing memory.db concurrently. Any
+        # transient read failure degrades to {} rather than breaking search.
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            return {}
+        name_to_summary: dict[str, str] = {}
+        try:
+            rows = conn.execute(
+                "SELECT entity_id, canonical_name, summary FROM entities "
+                "WHERE contact_key IS NOT NULL AND summary IS NOT NULL "
+                "AND summary != '' AND merged_into IS NULL"
+            ).fetchall()
+            for r in rows:
+                if r["summary"] == _DOSSIER_TOO_THIN:
+                    continue
+                surfaces = {r["canonical_name"]}
+                for a in conn.execute(
+                    "SELECT surface FROM aliases WHERE entity_id=? "
+                    "AND kind IN ('name', 'handle')", (r["entity_id"],)
+                ):
+                    surfaces.add(a["surface"])
+                for name in surfaces:
+                    if name:
+                        name_to_summary.setdefault(name, r["summary"])
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+        if not name_to_summary:
+            return {}
+        stats = self._contact_activity_stats(set(name_to_summary))
+        out: dict[str, dict] = {}
+        for name, summary in name_to_summary.items():
+            (first, last), total, recent = stats.get(name, (("", ""), 0, 0))
+            out[name] = {
+                "summary": summary,
+                "total_chunks": total,
+                "last_30d_chunks": recent,
+                "first": first,
+                "last": last,
+            }
+        return out
+
+    def _contact_activity_stats(
+        self, names: set[str]
+    ) -> dict[str, tuple[tuple[str, str], int, int]]:
+        """One pass over imessage chunks → per-name (first,last) dates, total
+        chunks, and last-30-day chunks. Mirrors the legacy contact_summaries stats."""
+        import datetime as _dt
+        cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=30)).isoformat()
+        agg = {n: {"first": "", "last": "", "total": 0, "recent": 0} for n in names}
+        with self._open_db() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT contact_names, date_start FROM chunks WHERE source='imessage'"
+                )
+            except sqlite3.OperationalError:
+                return {}
+            for r in rows:
+                try:
+                    contacts = json.loads(r["contact_names"] or "[]")
+                except (TypeError, ValueError):
+                    continue
+                ds = r["date_start"] or ""
+                for name in contacts:
+                    a = agg.get(name)
+                    if a is None:
+                        continue
+                    a["total"] += 1
+                    if ds and (not a["first"] or ds < a["first"]):
+                        a["first"] = ds
+                    if ds and (not a["last"] or ds > a["last"]):
+                        a["last"] = ds
+                    if ds and ds >= cutoff:
+                        a["recent"] += 1
+        return {
+            n: ((a["first"][:10], a["last"][:10]), a["total"], a["recent"])
+            for n, a in agg.items()
+        }
 
     def _open_db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
@@ -341,8 +502,8 @@ class SearchEngine:
             ).fetchone()
         return row["path"] if row else None
 
-    def _fts_search(self, query: str, k: int) -> list[str]:
-        match = _build_fts_match(query)
+    def _fts_search(self, query: str, k: int, alias_terms: list[str] | None = None) -> list[str]:
+        match = _build_fts_match(query, alias_terms)
         if not match:
             return []
         with self._open_db() as conn:
@@ -503,12 +664,28 @@ class SearchEngine:
 
         # 1) Temporal stripping — independent of intent. We still want
         #    "yesterday" / "last week" detection on top of source filters.
-        cleaned_query, trange = temporal.parse(req.query)
+        #    Under asof (eval-only time travel), relative phrases resolve
+        #    against the pretend-today instead of the wall clock.
+        asof_now = None
+        if req.asof:
+            import datetime as _dt
+            try:
+                asof_now = _dt.datetime.fromisoformat(req.asof)
+            except ValueError:
+                print(f"[search] ignoring malformed asof {req.asof!r}", file=sys.stderr)
+        cleaned_query, trange = temporal.parse(req.query, now=asof_now)
         # 2) The on-device router gives us the semantic core. Prefer it,
         #    fall back to the temporal-stripped query, then the raw query.
         topic = (intent.topic or "").strip()
         embed_query = topic or (cleaned_query if cleaned_query.strip() else req.query)
         date_filter = trange.to_iso_range() if trange else None
+        # Hard time-travel bound: with asof set, retrieval must never surface
+        # evidence from after that date. The future evidence is REMOVED here,
+        # not prompt-labeled "ignore" — labels leak, removal doesn't.
+        if asof_now is not None:
+            asof_end = f"{req.asof[:10]}T23:59:59"
+            after_iso, before_iso = date_filter or (None, None)
+            date_filter = (after_iso, min(before_iso, asof_end) if before_iso else asof_end)
 
         # 3) Translate intent into retrieval-time filters.
         source_filter: set[str] | None = set(intent.sources) if intent.sources else None
@@ -541,30 +718,121 @@ class SearchEngine:
         run_text = source_filter is None or bool(source_filter - {"image"})
         run_image = source_filter is None or "image" in source_filter
 
+        # ── Phase 5: entity linking (pure SQLite, <10ms) drives ADDITIVE
+        # retrieval. All of it is gated on an active layer AND at least one
+        # linked entity; when nothing links (or the layer is off) the pipeline
+        # is byte-identical to the pre-entity baseline.
+        link_result: LinkResult | None = None
+        alias_terms: list[str] = []
+        entity_ids: list[str] = []
+        canonical_rewrites: list[str] = []
+        if self.entity_layer is not None and run_text:
+            link_result = self.entity_layer.link(
+                cleaned_query, req.query, intent.contacts, req.asof
+            )
+            log_link(req.query, link_result)
+            entity_ids = link_result.ids
+            for e in link_result.linked:
+                alias_terms.extend(e.name_aliases)
+            embed_norm = _normalize_name(embed_query)
+            seen_canon: set[str] = set()
+            for e in link_result.linked[:2]:
+                # ent_me / self canonical ("Me") is a meaningless dense query — skip.
+                if e.is_self:
+                    continue
+                key = _normalize_name(e.canonical_name)
+                if key and key != embed_norm and key not in seen_canon:
+                    seen_canon.add(key)
+                    canonical_rewrites.append(e.canonical_name.strip())
+            agg_op = detect_aggregate_operator(req.query)
+            if agg_op:
+                print(f"[entities] aggregate operator '{agg_op}' detected; entities to "
+                      f"compute over: {entity_ids or 'none'}", file=sys.stderr)
+
         dense_task = asyncio.create_task(asyncio.to_thread(self._dense_search, embed_query, FUSE_FETCH * (4 if source_filter else 1))) if run_text else None
-        fts_task = asyncio.create_task(asyncio.to_thread(self._fts_search, embed_query, FUSE_FETCH * (4 if source_filter else 1))) if run_text else None
+        fts_task = asyncio.create_task(asyncio.to_thread(self._fts_search, embed_query, FUSE_FETCH * (4 if source_filter else 1), alias_terms)) if run_text else None
         image_task = asyncio.create_task(asyncio.to_thread(self._image_search, embed_query, max(4, req.top_k))) if run_image else None
         remote_task = asyncio.create_task(hyperspell.search(req.query, top_k=req.top_k))
         date_task = None
-        if date_filter and run_text:
+        # Launch the date retriever only when the QUERY carries a temporal
+        # phrase. An asof bound alone is a filter, not a retrieval signal —
+        # a recency list of pre-asof chunks would just pollute RRF.
+        if trange and date_filter and run_text:
             after_iso, before_iso = date_filter
             date_task = asyncio.create_task(
                 asyncio.to_thread(self._date_search, after_iso, before_iso, FUSE_FETCH)
             )
 
-        tasks: list = [t for t in (dense_task, fts_task, image_task, remote_task, date_task) if t is not None]
+        # Phase 5 additive retrievers: graph (claims' evidence chunks), an extra
+        # dense list per canonical-name rewrite, and the aggregate's evidence pool.
+        graph_task = None
+        agg_task = None
+        canon_tasks: list = []
+        if self.entity_layer is not None and entity_ids:
+            graph_task = asyncio.create_task(
+                asyncio.to_thread(self.entity_layer.graph_chunks, entity_ids, req.asof, FUSE_FETCH)
+            )
+            agg_task = asyncio.create_task(
+                asyncio.to_thread(self.entity_layer.aggregate, req.query, link_result.linked, req.asof)
+            )
+            for cn in canonical_rewrites:
+                canon_tasks.append(
+                    asyncio.create_task(asyncio.to_thread(self._dense_search, cn, FUSE_FETCH))
+                )
+
+        ordered_tasks = [dense_task, fts_task, image_task, remote_task, date_task,
+                         graph_task, agg_task, *canon_tasks]
+        tasks: list = [t for t in ordered_tasks if t is not None]
         results_list = await asyncio.gather(*tasks)
-        results = dict(zip([t for t in (dense_task, fts_task, image_task, remote_task, date_task) if t is not None], results_list))
+        results = dict(zip(tasks, results_list))
         dense_ids = results.get(dense_task, [])
         fts_ids = results.get(fts_task, [])
         image_results = results.get(image_task, [])
         remote_results = results.get(remote_task, [])
         date_ids = results.get(date_task, [])
+        graph_ids = results.get(graph_task, []) or []
+        agg_result: AggregateResult | None = results.get(agg_task, None)
+        canon_id_lists = [results.get(t, []) for t in canon_tasks]
 
+        fused_lists = [dense_ids, fts_ids]
         if date_ids:
-            fused = self._rrf(dense_ids, fts_ids, date_ids)
-        else:
-            fused = self._rrf(dense_ids, fts_ids)
+            fused_lists.append(date_ids)
+        if self.entity_layer is not None:
+            if graph_ids:
+                fused_lists.append(graph_ids)
+            for cids in canon_id_lists:
+                if cids:
+                    fused_lists.append(cids)
+            if agg_result and agg_result.evidence_chunk_ids:
+                fused_lists.append(agg_result.evidence_chunk_ids)
+        fused = self._rrf(*fused_lists)
+
+        # Phase 6: entity dossiers + the present-state routing decision, shared
+        # by the graph-pin, the rerank guard, and the synthesizer. Gated so that
+        # with SEMSE_ENTITY_SYNTH=0 (or the layer off) nothing here changes.
+        entity_synth_on = (
+            self.entity_layer is not None
+            and link_result is not None
+            and bool(link_result.linked)
+            and os.getenv("SEMSE_ENTITY_SYNTH", "1") != "0"
+        )
+        dossiers = (
+            self.entity_layer.dossiers(link_result.linked, req.asof)
+            if entity_synth_on else []
+        )
+        route_to_general = bool(contact_filter) and (
+            (_is_state_question(req.query) and any(_has_reportable_state(d) for d in dossiers))
+            or (
+                bool(_REPLY_QUESTION_RE.search(req.query))
+                and any(not d.is_self and not d.has_own_assertions for d in dossiers)
+            )
+        )
+        # For a state question routed to the general path the graph retriever's
+        # claim-evidence chunks ARE the answer's evidence (e.g. the terse "family
+        # lives in china" window). They rarely rank top-k in RRF on their own, so
+        # pin the leading few to the front of the fused order before hydration.
+        if route_to_general and graph_ids:
+            fused = _pin_front(fused, graph_ids[:3])
 
         # When contact-filtered, over-hydrate so we have enough material to
         # re-rank by contact-only similarity below; otherwise the top-K cut
@@ -584,7 +852,12 @@ class SearchEngine:
         # chunk dominated by the USER's monologue about a topic outrank a
         # chunk where the contact actually spoke on it. We re-score using
         # only contact-spoken text, then truncate to top_k.
-        if contact_filter is not None and local:
+        #
+        # Skipped for present-state/non-reply questions routed to the general
+        # path: that rerank favors chatty chunks and buries the terse
+        # claim-evidence chunk (the graph retriever's "where is X" answer), so
+        # for those we keep the fused ordering where graph evidence ranks high.
+        if contact_filter is not None and local and not route_to_general:
             local = await asyncio.to_thread(
                 self._rerank_by_contact_similarity,
                 local, contact_filter, embed_query, req.top_k,
@@ -614,11 +887,31 @@ class SearchEngine:
             local = self._hydrate(fused, req.top_k, date_range=date_filter, query=embed_query)
 
         merged = self._merge_results(local, image_results, remote_results, max_total=req.top_k)
-        answer = await self._synthesize(req.query, merged, trange, target_contacts=contact_filter)
+        computed_context = agg_result.text if agg_result else None
+        answer = await self._synthesize(
+            req.query, merged, trange, target_contacts=contact_filter, asof=req.asof,
+            computed_context=computed_context,
+            linked=link_result.linked if link_result else [],
+            dossiers=dossiers, route_to_general=route_to_general,
+        )
+        entities_out: list[LinkedEntitySummary] = []
+        if link_result:
+            entities_out = [
+                LinkedEntitySummary(
+                    entity_id=e.entity_id,
+                    canonical_name=e.canonical_name,
+                    kind=e.kind,
+                    summary=e.summary,
+                    score=e.score,
+                    reasons=e.reasons,
+                )
+                for e in link_result.linked
+            ]
         return SearchResponse(
             answer=answer,
             sources=merged,
             query_ms=int((time.perf_counter() - t0) * 1000),
+            entities=entities_out,
         )
 
     @staticmethod
@@ -651,6 +944,11 @@ class SearchEngine:
         sources: list[SourceResult],
         trange: temporal.TemporalRange | None = None,
         target_contacts: set[str] | None = None,
+        asof: str | None = None,
+        computed_context: str | None = None,
+        linked: list[LinkedEntity] | None = None,
+        dossiers: list[EntityDossier] | None = None,
+        route_to_general: bool = False,
     ) -> str:
         """Synthesize an answer from retrieved excerpts.
 
@@ -659,15 +957,45 @@ class SearchEngine:
         Past attempts kept the user's words in via labels and lost — the LLM
         consistently leaked user opinions back as the contact's. The simpler
         the input, the safer the output.
+
+        `computed_context` (Phase 5) is a server-computed aggregate line (counts,
+        span endpoints, first/last dates) that is authoritative over the top-k
+        excerpts for coverage questions.
+
+        `linked` (Phase 6) are the query-time-linked entities. When entity
+        synthesis is on (SEMSE_ENTITY_SYNTH != 0 and the layer is loaded) their
+        consolidated, server-labeled claims are injected as a "Known entities"
+        block, and present-state questions about a contact are steered off the
+        contact-PROFILE path onto the general path so the answer is the state,
+        not a personality sketch.
         """
         if not sources or not os.getenv("OPENAI_API_KEY"):
             return ""
         if not _looks_like_question(query):
             return ""
 
-        if target_contacts:
+        # Phase 6 entity synthesis is gated: with it off, behavior is exactly the
+        # pre-Phase-6 pipeline (no dossiers, no routing change, no entity notes).
+        # `dossiers` and `route_to_general` are precomputed in search() (which
+        # also uses `route_to_general` to skip the contact-similarity rerank);
+        # honor them here so the two stay consistent.
+        entity_synth_on = (
+            self.entity_layer is not None
+            and bool(linked)
+            and os.getenv("SEMSE_ENTITY_SYNTH", "1") != "0"
+        )
+        if not entity_synth_on:
+            dossiers = []
+        dossiers = dossiers or []
+
+        if target_contacts and not route_to_general:
+            # computed_context + background block are Phase-6 additions; keep them
+            # behind the synth gate so SEMSE_ENTITY_SYNTH=0 restores end-of-Phase-5
+            # behavior exactly (computed line dropped, no background block).
             return await self._synthesize_contact_focused(
-                query, sources, trange, target_contacts
+                query, sources, trange, target_contacts, asof,
+                computed_context=computed_context if entity_synth_on else None,
+                dossiers=dossiers,
             )
 
         excerpts: list[str] = []
@@ -709,8 +1037,9 @@ class SearchEngine:
                 contact_block = "Known contacts in this excerpt set:\n" + "\n".join(lines) + "\n\n"
         # Pass current date and any detected temporal range to the LLM so it can
         # reason about "yesterday" / "last week" against the excerpt dates.
+        # `asof` overrides the real date for eval reproducibility (defaults today).
         import datetime as _dt
-        today = _dt.date.today().isoformat()
+        today = asof or _dt.date.today().isoformat()
         date_note = f"Today is {today}."
 
         if trange:
@@ -721,6 +1050,25 @@ class SearchEngine:
                 f"{after} and {before}. Only use excerpts in that range; ignore any older "
                 "matches even if they contain similar words."
             )
+        # Server-computed aggregate (counts/first/last/list) is authoritative for
+        # coverage — the excerpts are only a sample. Never imply a small total
+        # from the number of excerpts shown.
+        computed_block = ""
+        if computed_context:
+            computed_block = (
+                f"{computed_context}\nWhen the question is about a count, frequency, or "
+                f"first/last date, answer from this computed line — the excerpts below are "
+                f"only a few example days.\n\n"
+            )
+        # Phase 6: consolidated entity facts (server-labeled) + generic-rule notes.
+        # Drop the self dossier from the block unless the question is genuinely
+        # about the user — an object-"me" query ("did X get back to me") links
+        # ent_me but the user's own facts are pure noise for it.
+        block_dossiers = dossiers if _is_self_subject_query(query) else [
+            d for d in dossiers if not d.is_self
+        ]
+        entity_block = _known_entities_block(block_dossiers)
+        notes_block = _entity_notes_block(query, dossiers)
         try:
             resp = await self._openai.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -728,7 +1076,7 @@ class SearchEngine:
                 max_tokens=300,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"{date_note}\n\n{contact_block}Query: {query}\n\nExcerpts:\n{context}"},
+                    {"role": "user", "content": f"{date_note}\n\n{notes_block}{computed_block}{entity_block}{contact_block}Query: {query}\n\nExcerpts:\n{context}"},
                 ],
             )
             answer = (resp.choices[0].message.content or "").strip()
@@ -746,12 +1094,22 @@ class SearchEngine:
         sources: list[SourceResult],
         trange: temporal.TemporalRange | None,
         target_contacts: set[str],
+        asof: str | None = None,
+        computed_context: str | None = None,
+        dossiers: list[EntityDossier] | None = None,
     ) -> str:
         """Strict path: the LLM sees ONLY the targeted contacts' own messages.
 
         No user lines, no other speakers, no [EVIDENCE]/[CONTEXT] labels —
         the format is unmistakable: every line is a message the contact
         sent. Pattern/tone inference is still encouraged by the prompt.
+
+        Phase 6 additions: a `computed_context` line (aggregate coverage, when a
+        contact-filtered query is also an aggregate one) and a "Background facts"
+        block of the contact's consolidated claims. The background block is fed
+        as a SEPARATE part of the message and is deliberately NOT part of the
+        quote-validator haystack (`context`), so any quote the model lifts from
+        it fails validation and gets stripped by the existing machinery.
         """
         # Gather only the contact's lines across all sources, with light
         # source headers so the model knows messages come from different
@@ -786,7 +1144,7 @@ class SearchEngine:
         # own words, which is what the quote validator also checks against.
 
         import datetime as _dt
-        today = _dt.date.today().isoformat()
+        today = asof or _dt.date.today().isoformat()
         date_note = f"Today is {today}."
         if trange:
             after = trange.after.date().isoformat() if trange.after else "?"
@@ -796,8 +1154,20 @@ class SearchEngine:
                 f"Only use excerpts in that range."
             )
 
+        # Background-facts block: reference context, NOT part of `context` (the
+        # quote-validator haystack). A quote lifted from here won't be found in
+        # `context` and is auto-stripped downstream.
+        background_block = _background_facts_block(dossiers or [])
+        computed_block = ""
+        if computed_context:
+            computed_block = (
+                f"{computed_context}\nFor a count/frequency/first-last question, answer "
+                f"from this computed line, not from the number of messages shown.\n\n"
+            )
+
         user_content = (
             f"{date_note}\n\n"
+            f"{computed_block}{background_block}"
             f"Query: {query}\n\n"
             f"Messages from {names} (the only person/people whose words you can see):\n"
             f"{context}"
@@ -836,6 +1206,153 @@ class SearchEngine:
             return answer
         except Exception:
             return ""
+
+
+# ── Phase 6: entity-synthesis formatting + routing helpers ──────────────────
+
+_STATE_QUESTION_RE = re.compile(
+    r"\bwhere\b"
+    r"|\b(right now|currently|these days|nowadays|at the moment)\b"
+    r"|\bstill\b"
+    r"|\b(is|are|was|were)\b[\w'’ ]{0,40}\b(in|at|back|home|here|there)\b"
+    r"|\b(is|are|was|were)\b[\w'’ ]{0,40}\b\w+ing\b",
+    re.I,
+)
+
+_REPLY_QUESTION_RE = re.compile(
+    r"\b(get back|got back|repl(y|ied|ies)|respond(ed)?|response|"
+    r"answer(ed)?|hear back|heard back|write back|wrote back|ever say)\b",
+    re.I,
+)
+
+# Subject-position self reference ("what did I…", "my plans") — NOT the object
+# "me" ("did X get back to me"), which links ent_me but is not a self-subject
+# question. Gating the SELF-QUERY note on this avoids nudging object-"me" answers.
+_SELF_SUBJECT_RE = re.compile(r"\b(i|my|mine|myself)\b", re.I)
+
+
+def _is_self_subject_query(query: str) -> bool:
+    return bool(_SELF_SUBJECT_RE.search(query or ""))
+
+
+def _pin_front(
+    ranked: list[tuple[str, float]], pin_ids: list[str]
+) -> list[tuple[str, float]]:
+    """Move `pin_ids` (in their given order) to the front of a fused ranking,
+    keeping the remaining order. Ids absent from `ranked` are skipped."""
+    present = {cid for cid, _ in ranked}
+    pinned = [cid for cid in dict.fromkeys(pin_ids) if cid in present]
+    if not pinned:
+        return ranked
+    pinset = set(pinned)
+    top_score = ranked[0][1] if ranked else 1.0
+    front = [(cid, top_score + len(pinned) - i) for i, cid in enumerate(pinned)]
+    return front + [(cid, s) for cid, s in ranked if cid not in pinset]
+
+
+def _is_state_question(query: str) -> bool:
+    """Present-state / location / status questions ('where is X', 'is X still
+    Y', 'is X in Z', 'is X staying'). These want the current-or-transitioned
+    state, which the general path answers from labeled claims — not the
+    contact-PROFILE path, which sketches a personality."""
+    return bool(_STATE_QUESTION_RE.search(query or ""))
+
+
+def _has_reportable_state(d: EntityDossier) -> bool:
+    """The entity carries a bounded or transitioned state — worth steering a
+    present-state question onto the general path: any EXPIRED/SUPERSEDED claim,
+    or a CURRENT claim that still carries a validity bound."""
+    for c in d.claims:
+        if c.label in (CLAIM_EXPIRED, CLAIM_SUPERSEDED):
+            return True
+        if c.label == CLAIM_CURRENT and c.valid_until:
+            return True
+    return False
+
+
+def _format_claim(c) -> str | None:
+    obj = (c.object_label or "").strip()
+    if not obj:
+        return None
+    rel = (c.relation or "").replace("_", " ").strip()
+    if c.label == CLAIM_CURRENT:
+        tag = "CURRENT"
+    elif c.label == CLAIM_EXPIRED:
+        tag = f"EXPIRED — ended {c.valid_until}" if c.valid_until else "EXPIRED"
+    else:
+        tag = "SUPERSEDED"
+    hearsay = " (you said this, not them)" if c.asserted_by_self else ""
+    return f"    · {rel} {obj} [{tag}{hearsay}]"
+
+
+def _dossier_lines(d: EntityDossier) -> list[str]:
+    others = [a for a in d.aliases if a and a.lower() != (d.canonical_name or "").lower()]
+    alias = f" (aka {', '.join(others[:3])})" if others else ""
+    body = [ln for ln in (_format_claim(c) for c in d.claims) if ln]
+    if not body:
+        return []
+    return [f"- {d.canonical_name} [{d.kind}]{alias}:", *body]
+
+
+def _known_entities_block(dossiers: list[EntityDossier]) -> str:
+    if not dossiers:
+        return ""
+    chunks = ["\n".join(lines) for lines in (_dossier_lines(d) for d in dossiers) if lines]
+    if not chunks:
+        return ""
+    return (
+        "Known entities (consolidated facts about what the query names — treat as "
+        "factual context; obey each fact's status label):\n"
+        + "\n".join(chunks) + "\n\n"
+    )
+
+
+def _background_facts_block(dossiers: list[EntityDossier]) -> str:
+    """Reduced subject-only view for the contact-focused path. Framed as
+    non-quotable background and NOT part of the quote-validator haystack, so a
+    quote lifted from here fails validation and gets stripped."""
+    subjects = [d for d in dossiers if not d.is_self]
+    chunks = ["\n".join(lines) for lines in (_dossier_lines(d) for d in subjects) if lines]
+    if not chunks:
+        return ""
+    name = subjects[0].canonical_name
+    return (
+        f"Background facts about {name} (not their words — never quote from this; "
+        f"obey each status label):\n"
+        + "\n".join(chunks) + "\n\n"
+    )
+
+
+def _entity_notes_block(query: str, dossiers: list[EntityDossier]) -> str:
+    """Generic synthesis-rule notes (self-subject, non-reply, disambiguation).
+    Emitted only when the store actually supports the note, so nothing fires
+    speculatively."""
+    notes: list[str] = []
+    if any(d.is_self for d in dossiers) and _is_self_subject_query(query):
+        notes.append(
+            'SELF-QUERY: this question is about the user (Me). The "Me:" lines in the '
+            "excerpts ARE the evidence — answer from them."
+        )
+    if _REPLY_QUESTION_RE.search(query or ""):
+        silent = [d.canonical_name for d in dossiers
+                  if not d.is_self and not d.has_own_assertions]
+        if silent:
+            notes.append(
+                "NO REPLY ON RECORD: nothing is on record asserted by "
+                + ", ".join(silent)
+                + " — treat as no reply received. The user's own outreach is not that "
+                "person's confirmation."
+            )
+    persons = [d for d in dossiers if d.kind == "person" and not d.is_self]
+    firsts = [(d.canonical_name or "").strip().split()[0].lower() for d in persons
+              if d.canonical_name]
+    if len(firsts) != len(set(firsts)):  # two linked people share a first name
+        notes.append(
+            "MULTIPLE CANDIDATES: more than one person matches that name — "
+            + "; ".join(d.canonical_name for d in persons)
+            + ". Present the candidates; do not silently pick one."
+        )
+    return ("\n".join(notes) + "\n\n") if notes else ""
 
 
 _QUESTION_LEAD_WORDS = {
@@ -907,7 +1424,7 @@ def _validate_no_invented_quotes(answer: str, allowed_text: str) -> tuple[bool, 
     whitespace collapsed, and ignoring surrounding punctuation) inside
     `allowed_text`. Returns (ok, offending_quote).
 
-    Defense against gpt-4o-mini fabricating "alarm said 'so peak'" when those
+    Defense against gpt-4o-mini fabricating "Jordan said 'so peak'" when those
     words were never in the excerpts. A single fabricated quote rejects the
     whole answer — the user gets nothing instead of misinformation.
     """
@@ -940,18 +1457,41 @@ def _label(source: str) -> str:
 _FTS_TOKEN_SAFE = re.compile(r"[A-Za-z0-9]+")
 
 
-def _build_fts_match(query: str) -> str:
+def _build_fts_match(query: str, alias_terms: list[str] | None = None) -> str:
     """Tokenize a free-text query into an FTS5 MATCH expression with prefix tokens.
 
     Uses OR so we maximize recall (a chunk mentioning *either* term is a candidate);
     RRF will surface the strongest matches when fused with dense retrieval.
     Stripped of stop-words and short tokens to avoid noise.
+
+    `alias_terms` (Phase 5) are surfaces of linked entities' name/nickname aliases,
+    OR-appended so a query in one era's vocabulary ("cadence") also reaches the
+    other era's chunks ("sendcraft"). Multi-word aliases become quoted phrases.
     """
     tokens = [t.lower() for t in _FTS_TOKEN_SAFE.findall(query) if len(t) >= 2]
     tokens = [t for t in tokens if t not in _STOP]
-    if not tokens:
+    clauses = [f"{t}*" for t in tokens]
+    for term in _alias_fts_clauses(alias_terms or []):
+        if term not in clauses:
+            clauses.append(term)
+    if not clauses:
         return ""
-    return " OR ".join(f"{t}*" for t in tokens)
+    return " OR ".join(clauses)
+
+
+def _alias_fts_clauses(alias_terms: list[str]) -> list[str]:
+    """Turn linked-entity alias surfaces into FTS5 OR-clauses: single words become
+    prefix tokens, multi-word surfaces become quoted phrases."""
+    out: list[str] = []
+    for surface in alias_terms:
+        toks = [t.lower() for t in _FTS_TOKEN_SAFE.findall(surface) if len(t) >= 2]
+        if not toks:
+            continue
+        if len(toks) == 1:
+            out.append(f"{toks[0]}*")
+        else:
+            out.append('"' + " ".join(toks) + '"')
+    return out
 
 
 _STOP = {

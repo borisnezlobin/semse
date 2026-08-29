@@ -1,0 +1,44 @@
+{
+  "arc": "supersession",
+  "description": "A fact is stated, then restated with a new value. The old claim is invalidated (superseded), never deleted; the current answer is the newest value, and the change is reportable. Mirrors the college-commit supersession with fabricated data.",
+  "thread_key": "fixture:imessage:+15550000003",
+  "participants": ["Me", "Priya"],
+  "messages": [
+    {"sender": "Priya", "is_from_me": false, "text": "team sync is locked for 3pm thursday", "date_iso": "2026-02-02T10:00:00"},
+    {"sender": "Me", "is_from_me": true, "text": "got it, 3pm thursday", "date_iso": "2026-02-02T10:05:00"},
+    {"sender": "Priya", "is_from_me": false, "text": "actually had to move the sync to 5pm, room conflict", "date_iso": "2026-02-04T16:30:00"},
+    {"sender": "Me", "is_from_me": true, "text": "5pm thursday works", "date_iso": "2026-02-04T16:32:00"}
+  ],
+  "expectations": {
+    "entities": [
+      {"canonical_name": "team sync", "kind": "event", "aliases": [{"surface": "the sync", "kind": "description", "valid_from": "2026-02-02", "valid_until": null}]}
+    ],
+    "claims": [
+      {
+        "claim_ref": "c1",
+        "subject": "team sync",
+        "relation": "scheduled_at",
+        "object_text": "Thursday 3pm",
+        "asserted_by": "Priya",
+        "stated_at": "2026-02-02",
+        "superseded_by": "c2",
+        "invalidated_at": "2026-02-04"
+      },
+      {
+        "claim_ref": "c2",
+        "subject": "team sync",
+        "relation": "scheduled_at",
+        "object_text": "Thursday 5pm",
+        "asserted_by": "Priya",
+        "stated_at": "2026-02-04",
+        "superseded_by": null
+      }
+    ],
+    "current_answer": {
+      "query": "when is the team sync?",
+      "must_convey": "5pm Thursday",
+      "must_not_convey_as_current": "3pm",
+      "may_mention_change": "moved from 3pm to 5pm"
+    }
+  }
+}

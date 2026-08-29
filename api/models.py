@@ -25,6 +25,9 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     top_k: int = 8
     intent: QueryIntent | None = None
+    # ISO date the synthesizer treats as "today" for expiry/recency reasoning.
+    # Eval-only: the Swift client never sends it, so it defaults to the real date.
+    asof: str | None = None
 
 
 class ChunkMessage(BaseModel):
@@ -53,7 +56,21 @@ class SourceResult(BaseModel):
     attachment_id: int | None = None
 
 
+class LinkedEntitySummary(BaseModel):
+    """A query-time-linked entity from the consolidation store (Phase 5).
+
+    Populated only when the entity layer is on; the Swift client ignores unknown
+    keys, so this is additive and safe to omit."""
+    entity_id: str
+    canonical_name: str
+    kind: str
+    summary: str | None = None
+    score: float
+    reasons: list[str] = []
+
+
 class SearchResponse(BaseModel):
     answer: str
     sources: list[SourceResult]
     query_ms: int
+    entities: list[LinkedEntitySummary] = []

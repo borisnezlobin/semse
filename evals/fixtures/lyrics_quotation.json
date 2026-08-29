@@ -1,0 +1,42 @@
+{
+  "arc": "lyrics_quotation",
+  "description": "Borrowed text (song lyrics / quotation) carries no propositional content and must yield NO literal claim. The counterpoint: a lyric whose meaning IS taken up by the surrounding conversation may earn a motif note or a real claim. Mirrors the Muse 'Hush' inspection case with fabricated data.",
+  "thread_key": "fixture:imessage:+15550000004",
+  "participants": ["Me", "Sam"],
+  "no_claim_arc": {
+    "messages": [
+      {"sender": "Me", "is_from_me": true, "text": "hello darkness my old friend", "date_iso": "2026-05-01T23:10:00"},
+      {"sender": "Sam", "is_from_me": false, "text": "lmaooo go to sleep", "date_iso": "2026-05-01T23:12:00"}
+    ],
+    "expectations": {
+      "must_yield_no_claim_from": [
+        {"date_iso": "2026-05-01T23:10:00", "reason": "Simon & Garfunkel lyric quoted for register/humor; no situation asserted"}
+      ],
+      "claims": [],
+      "at_most": "a state-note only if it became a recurring motif (it does not here)"
+    }
+  },
+  "uptake_arc": {
+    "description": "Same borrowed phrasing, but the conversation takes it literally and confirms a real situation, so a claim IS warranted.",
+    "messages": [
+      {"sender": "Sam", "is_from_me": false, "text": "we'll always have Paris", "date_iso": "2026-05-10T20:00:00"},
+      {"sender": "Me", "is_from_me": true, "text": "wait are we actually booking Paris for september though", "date_iso": "2026-05-10T20:02:00"},
+      {"sender": "Sam", "is_from_me": false, "text": "yes! flights are booked, sept 12-19", "date_iso": "2026-05-10T20:05:00"}
+    ],
+    "expectations": {
+      "must_yield_no_claim_from": [
+        {"date_iso": "2026-05-10T20:00:00", "reason": "the 'we'll always have Paris' line alone is a quotation"}
+      ],
+      "claims": [
+        {
+          "subject": "Me and Sam",
+          "relation": "planned_trip",
+          "object_text": "Paris, Sept 12-19",
+          "asserted_by": "Sam",
+          "stated_at": "2026-05-10",
+          "note": "the quotation gained a real referent via conversational uptake ('flights are booked'); the claim comes from the uptake, not the lyric"
+        }
+      ]
+    }
+  }
+}

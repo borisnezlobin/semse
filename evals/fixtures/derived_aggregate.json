@@ -1,0 +1,42 @@
+{
+  "arc": "derived_aggregate",
+  "description": "An in-message statistical assertion contradicts computable reality. The assertion is stored as a `derived` claim (assertion != truth); when the content is computable from entity_mentions the computed value wins at synthesis and the discrepancy is reported. Mirrors the 'boba on >20% of days' self-ingestion case with fabricated data.",
+  "thread_key": "fixture:imessage:+15550000005",
+  "participants": ["Me", "Casey"],
+  "messages": [
+    {"sender": "Me", "is_from_me": true, "text": "we got coffee again this morning", "date_iso": "2026-06-02T09:00:00"},
+    {"sender": "Casey", "is_from_me": false, "text": "coffee run before the meeting?", "date_iso": "2026-06-09T08:30:00"},
+    {"sender": "Me", "is_from_me": true, "text": "grabbed coffee together after class", "date_iso": "2026-06-20T15:00:00"},
+    {"sender": "Me", "is_from_me": true, "text": "honestly we get coffee like every single day this month", "date_iso": "2026-06-28T19:00:00"},
+    {"sender": "Casey", "is_from_me": false, "text": "haha not every day but a lot", "date_iso": "2026-06-28T19:02:00"}
+  ],
+  "expectations": {
+    "entities": [
+      {"canonical_name": "coffee (with Casey)", "kind": "activity", "aliases": []}
+    ],
+    "entity_mentions_ground_truth": {
+      "activity": "coffee (with Casey)",
+      "distinct_outing_days": ["2026-06-02", "2026-06-09", "2026-06-20"],
+      "distinct_outing_day_count": 3,
+      "month_days": 30,
+      "computed_fraction_of_days": "3/30 = 10%"
+    },
+    "claims": [
+      {
+        "subject": "Me and Casey",
+        "relation": "frequency_assertion",
+        "object_text": "get coffee every single day this month",
+        "asserted_by": "Me",
+        "stated_at": "2026-06-28",
+        "derived": true,
+        "note": "aggregate/statistical assertion — must be stored as derived, NOT independent ground truth"
+      }
+    ],
+    "synthesis_behavior": {
+      "query": "how often do we get coffee?",
+      "computed_wins": "answer from entity_mentions: 3 distinct outing-days in June (~10% of days)",
+      "must_report_discrepancy": "you said 'every single day'; the data shows 3 days (~10%) this month",
+      "metric_pinned": "distinct outing-days, not mention-count"
+    }
+  }
+}

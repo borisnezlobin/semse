@@ -1,0 +1,36 @@
+{
+  "arc": "expiry",
+  "description": "A bounded state with an explicit end date. Before the bound the state is current; after it, the state has completed and must be reported as a transition. Mirrors the real Turkey-trip case with fabricated data.",
+  "thread_key": "fixture:imessage:+15550000002",
+  "participants": ["Me", "Jordan"],
+  "messages": [
+    {"sender": "Jordan", "is_from_me": false, "text": "flying to Lisbon tomorrow, staying the whole week", "date_iso": "2026-03-07T08:10:00"},
+    {"sender": "Me", "is_from_me": true, "text": "amazing, when are you back", "date_iso": "2026-03-07T08:12:00"},
+    {"sender": "Jordan", "is_from_me": false, "text": "flight home is Friday the 13th, lands ~6pm", "date_iso": "2026-03-07T08:15:00"},
+    {"sender": "Jordan", "is_from_me": false, "text": "Lisbon is unreal, the food here", "date_iso": "2026-03-10T14:00:00"},
+    {"sender": "Jordan", "is_from_me": false, "text": "just landed, so tired", "date_iso": "2026-03-13T18:22:00"},
+    {"sender": "Me", "is_from_me": true, "text": "welcome back!", "date_iso": "2026-03-13T18:40:00"}
+  ],
+  "expectations": {
+    "entities": [
+      {"canonical_name": "Jordan", "kind": "person", "aliases": []}
+    ],
+    "claims": [
+      {
+        "subject": "Jordan",
+        "relation": "located_in",
+        "object_text": "Lisbon",
+        "asserted_by": "Jordan",
+        "stated_at": "2026-03-07",
+        "valid_from": "2026-03-08",
+        "valid_until": "2026-03-13",
+        "note": "valid_until resolved from 'Friday the 13th' against the message timestamp"
+      }
+    ],
+    "asof_behavior": {
+      "query": "is Jordan in Lisbon right now?",
+      "asof_2026-03-10": "must assert Jordan IS in Lisbon (bound not yet passed)",
+      "asof_2026-03-20": "must report Jordan returned ~2026-03-13, NOT present-tense in-Lisbon"
+    }
+  }
+}

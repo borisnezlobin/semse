@@ -1,0 +1,39 @@
+{
+  "arc": "alias_drift",
+  "description": "A side project is referred to only descriptively at first, then named. A query in either vocabulary must resolve to the one entity. Mirrors the real cadence->Sendcraft case with fabricated data.",
+  "thread_key": "fixture:imessage:+15550000001",
+  "participants": ["Me", "Devin"],
+  "messages": [
+    {"sender": "Me", "is_from_me": true, "text": "been hacking on a little cli that batches your morning emails into one digest", "date_iso": "2025-06-03T21:14:00"},
+    {"sender": "Devin", "is_from_me": false, "text": "oh the email digest thing? how's it going", "date_iso": "2025-06-03T21:20:00"},
+    {"sender": "Me", "is_from_me": true, "text": "good, got the scheduler working. the project still needs a name lol", "date_iso": "2025-06-10T18:02:00"},
+    {"sender": "Me", "is_from_me": true, "text": "ok decided. calling it Quillstream", "date_iso": "2025-07-22T12:40:00"},
+    {"sender": "Devin", "is_from_me": false, "text": "Quillstream is clean. so this is the same digest cli right", "date_iso": "2025-07-22T12:45:00"},
+    {"sender": "Me", "is_from_me": true, "text": "yeah same thing, just named now. Quillstream shipped v0.1 today", "date_iso": "2025-08-05T09:30:00"},
+    {"sender": "Devin", "is_from_me": false, "text": "congrats. what's Quillstream pricing gonna be", "date_iso": "2025-08-05T09:33:00"},
+    {"sender": "Me", "is_from_me": true, "text": "free tier + $5/mo for teams", "date_iso": "2025-08-05T09:40:00"}
+  ],
+  "expectations": {
+    "entities": [
+      {
+        "canonical_name": "Quillstream",
+        "kind": "project",
+        "aliases": [
+          {"surface": "a little cli that batches your morning emails", "kind": "description", "valid_from": "2025-06-03", "valid_until": "2025-07-22"},
+          {"surface": "the email digest thing", "kind": "description", "valid_from": "2025-06-03", "valid_until": "2025-07-22"},
+          {"surface": "Quillstream", "kind": "name", "valid_from": "2025-07-22", "valid_until": null}
+        ]
+      }
+    ],
+    "claims": [
+      {"subject": "Quillstream", "relation": "named_on", "object_text": "2025-07-22", "asserted_by": "Me", "stated_at": "2025-07-22"},
+      {"subject": "Quillstream", "relation": "pricing", "object_text": "free tier + $5/mo for teams", "asserted_by": "Me", "stated_at": "2025-08-05"}
+    ],
+    "bridging": {
+      "old_vocabulary_query": "how's the email digest cli going",
+      "new_vocabulary_query": "how's Quillstream going",
+      "both_must_resolve_to_entity": "Quillstream",
+      "pricing_only_in": "name-era messages (>= 2025-07-22), reachable from the old-vocabulary query only via the alias bridge"
+    }
+  }
+}
